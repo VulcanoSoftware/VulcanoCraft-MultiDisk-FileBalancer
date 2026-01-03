@@ -1,0 +1,237 @@
+######################################################################
+# VulcanoCraft MultiDisk FileBalancer - configuration file
+#
+# This file contains everything the program needs to run.
+# The goal is that you do NOT need to change the code itself.
+#
+# Important:
+# - Everything starting with # is a comment and ignored by the program.
+# - Only change the values AFTER the : character.
+# - Always use absolute paths (for example C:\Games\Worlds\Map1).
+######################################################################
+
+######################################################################
+# GENERAL SETTINGS
+######################################################################
+
+# src:
+# This is the folder where new files arrive.
+# Example: an "input" folder where your download/recording/backup files
+# end up. The script automatically distributes these files
+# over the configured disks.
+src: C:\Users\user\Downloads\raid-0-sim-main\src1
+
+# webhook_url:
+# Optional: a Discord webhook URL for notifications.
+# - Leave empty ('') to disable Discord notifications.
+# - Paste your webhook URL here if you want notifications.
+webhook_url: ''
+
+######################################################################
+# RAID-0 / FILE DISTRIBUTION SETTINGS
+######################################################################
+
+# disks:
+# List of disks/folders where files will be moved.
+# - name: a short recognizable name (e.g. disk1, SSD, HDD1, etc.)
+# - path: the folder on that disk where files should end up.
+# You can add as many disks here as you like.
+disks:
+  - name: disk1
+    path: C:\Users\user\Downloads\raid-0-sim-main\target1
+  - name: disk2
+    path: C:\Users\user\Downloads\raid-0-sim-main\target2
+  - name: disk3
+    path: C:\Users\user\Downloads\raid-0-sim-main\target3
+
+# last_disk:
+# This is the name of the last disk that was used.
+# The script uses this to send the next file to the next
+# disk in the list (round-robin distribution).
+# - Normally you do NOT need to change this manually.
+# - If you want to force the script to start again at a specific
+#   disk, you can set a different name here.
+last_disk: disk1
+
+######################################################################
+# TECHNICAL SETTINGS FOR FILE DISTRIBUTION
+######################################################################
+
+settings:
+  # min_file_age_hours:
+  # A file must be at least this many hours old before it is moved.
+  # This prevents files that are still being written (for example
+  # recordings or downloads) from being moved too early.
+  # Example:
+  # - 4 means: only files older than 4 hours are moved.
+  min_file_age_hours: 4
+
+  # extra_safety_space_gb:
+  # Extra free space (in GB) that must be available on the target disk
+  # on top of the file size.
+  # Example:
+  # - File size = 10 GB, extra_safety_space_gb = 5
+  #   Requires at least 15 GB free on the target disk.
+  extra_safety_space_gb: 5
+
+  # scan_interval_seconds:
+  # How often the script checks the source folder for new files.
+  # Value is in seconds.
+  # Example:
+  # - 120 means: every 2 minutes.
+  scan_interval_seconds: 120
+
+  # console_clear_interval_hours:
+  # Every so many hours the console is cleared to keep things readable.
+  # Messages will still be sent to Discord (if configured).
+  console_clear_interval_hours: 6
+
+  # space_check_default_min_free_gb:
+  # Default minimum free space (in GB) for the "space hunter" feature
+  # when you configure it interactively in the program.
+  # Per disk below you can also set a custom min_free_gb.
+  space_check_default_min_free_gb: 40
+
+######################################################################
+# SPACE HUNTER - AUTOMATIC DISK CLEANUP
+######################################################################
+#
+# With "space_hunter_disks" you can configure disks which are
+# automatically cleaned up when free space becomes too low.
+#
+# For each disk you can configure:
+# - path:            The folder on the disk that is monitored.
+# - min_free_gb:     Minimum free space in GB you want to keep.
+# - action:          What happens when free space drops BELOW the limit:
+#                      * 'delete'  -> oldest file is permanently deleted
+#                      * 'move'    -> oldest file is moved
+# - move_destination:
+#                    Only needed when action = 'move'.
+#                    This is the folder where the oldest file is moved to.
+#
+# Note:
+# - The "oldest" file is determined by the last modified timestamp.
+# - Use this only on folders where it is safe to delete or move
+#   old files.
+space_hunter_disks:
+  - action: delete
+    min_free_gb: 40
+    path: C:\Users\user\Downloads\raid-0-sim-main\target1
+    move_destination: null
+
+  - action: delete
+    min_free_gb: 10
+    path: C:\Users\user\Downloads\raid-0-sim-main\target2
+    move_destination: null
+
+  - action: delete
+    min_free_gb: 80
+    path: C:\Users\user\Downloads\raid-0-sim-main\target3
+    move_destination: null
+
+######################################################################
+# REVERSE RAID 0 SIMULATOR - MERGE FILES BACK
+######################################################################
+#
+# With "reverse_raid" you can collect files that are spread across
+# multiple folders/disks back into a single central folder.
+# This works similarly to the separate reverse_raid program, but is
+# now integrated into this script and controlled entirely via this config.
+#
+# Typical use case:
+# - You have multiple target folders where the FileBalancer has placed
+#   files.
+# - You want to later move older files back into one folder (for example
+#   for a backup, archive or to free up space on the target disks).
+#
+# Note:
+# - Files are only moved if they are older than the configured
+#   min_file_age_hours value.
+# - If a file with the same name already exists in the destination
+#   folder, the file is skipped.
+reverse_raid:
+  # enabled:
+  # - true  = reverse RAID feature is active
+  # - false = reverse RAID feature is disabled
+  enabled: false
+
+  # source_paths:
+  # List of folders where the files CURRENTLY live (for example your
+  # target1/target2/target3 folders). The script will try to move
+  # files from these folders back to the destination.
+  source_paths:
+    - C:\Users\user\Downloads\raid-0-sim-main\target1
+    - C:\Users\user\Downloads\raid-0-sim-main\target2
+    - C:\Users\user\Downloads\raid-0-sim-main\target3
+
+  # destination_path:
+  # The folder where files are moved TO. This is often
+  # your original source folder or a separate "collection" folder.
+  destination_path: C:\Users\user\Downloads\raid-0-sim-main\src1
+
+  # min_file_age_hours:
+  # Only files at least this many hours old are moved.
+  # This prevents recently moved or still active files from being
+  # shuffled back and forth.
+  min_file_age_hours: 12
+
+  # run_interval_minutes:
+  # How often the reverse RAID check runs.
+  # - 10 means: roughly every 10 minutes it checks if files
+  #   can be moved from source_paths to destination_path.
+  run_interval_minutes: 10
+
+######################################################################
+# S3-LIKE SERVER FOR VIRTUAL DISK
+######################################################################
+#
+# With "s3_server" you can enable a simple HTTP server that
+# exposes files via an S3-like interface (PUT/GET/DELETE).
+# This is NOT real Amazon S3, but behaves similarly in spirit:
+# - You talk to the server over HTTP on host:port.
+# - Each path (e.g. /folder1/file.txt) is treated as a single object/file.
+#
+# Authentication:
+# - access_key: similar to a username.
+# - secret_key: similar to a password.
+# - Clients should send these headers:
+#     X-Access-Key: <access_key>
+#     X-Secret-Key: <secret_key>
+# - Leave both empty to disable authentication (only recommended
+#   on a trusted network).
+#
+# Files uploaded via this server are stored in the upload_src folder
+# below and later picked up by the FileBalancer and distributed over
+# the configured disks.
+s3_server:
+  enabled: true
+  host: 0.0.0.0
+  port: 9000
+  access_key: 'user'
+  secret_key: 'password123'
+  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
+
+######################################################################
+# SFTP SERVER FOR VIRTUAL DISK
+######################################################################
+#
+# With "sftp_server" you can enable an SFTP server so you can connect
+# with a normal SFTP client (for example WinSCP, FileZilla, Cyberduck,
+# etc.) as if this is a single large disk.
+#
+# Important points:
+# - Only username + password authentication is used.
+#   You do not need to set up or manage SSH keys.
+# - The folder you configure as upload_src below becomes the "root"
+#   you see in your SFTP client. Everything you put there will be
+#   picked up by the FileBalancer as input (just like the normal src
+#   folders).
+# - The actual distribution across the disks is then handled by the
+#   existing logic in the script.
+sftp_server:
+  enabled: true
+  host: 0.0.0.0
+  port: 2222
+  username: 'user'
+  password: 'password123'
+  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1

@@ -1,1 +1,1 @@
-pyinstaller -i icon.ico --onefile raid0sim.py
+pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
