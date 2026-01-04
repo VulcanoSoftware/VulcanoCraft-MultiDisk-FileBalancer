@@ -278,8 +278,3 @@ Because of these differences, the new name avoids suggesting that this is a stri
 - If a serious error occurs, the tool prints the exception and waits for user input before restarting.
 
 ---
-
-## License
-
-License information is not specified in this repository. If you intend to share or publish VulcanoCraft MultiDisk FileBalancer, you should add an appropriate license file (for example, MIT, Apache-2.0, etc.).
-
