@@ -1183,7 +1183,7 @@ def main():
                 if path:
                     reverse_source_paths.append(path)
             if not reverse_source_paths:
-                reverse_source_paths = [disk['pad'] for disk in disks if 'pad' in disk and disk.get('pad')]
+                reverse_source_paths = [disk['path'] for disk in disks if disk.get('path')]
             dest_input = input(f"Enter the destination folder for reverse RAID (default {src}): ").strip()
             if dest_input:
                 reverse_destination_path = dest_input
@@ -1239,6 +1239,24 @@ def main():
         src_folders.append(sftp_upload_src)
     start_sftp_server_thread(sftp_server_config, sftp_upload_src, webhook_url)
 
+    # Normalize disks: ensure every disk has both Dutch ('naam', 'pad') and English ('name', 'path') keys.
+    for disk in disks:
+        if 'name' not in disk and 'naam' in disk:
+            disk['name'] = disk['naam']
+        if 'naam' not in disk and 'name' in disk:
+            disk['naam'] = disk['name']
+        if 'path' not in disk and 'pad' in disk:
+            disk['path'] = disk['pad']
+        if 'pad' not in disk and 'path' in disk:
+            disk['pad'] = disk['path']
+
+    # Normalize space_hunter_disks: it uses 'path'/'pad' too.
+    for disk in space_hunter_disks:
+        if 'path' not in disk and 'pad' in disk:
+            disk['path'] = disk['pad']
+        if 'pad' not in disk and 'path' in disk:
+            disk['pad'] = disk['path']
+
     while True:
         try:
             valid_src_folders = []
@@ -1254,16 +1272,17 @@ def main():
                 continue
 
             for disk in disks:
-                if not os.path.exists(disk['pad']):
-                    print_and_discord(f"The folder {disk['pad']} does not exist. Creating the folder.", webhook_url)
-                    os.makedirs(disk['pad'])
+                disk_path = disk['path']
+                if not os.path.exists(disk_path):
+                    print_and_discord(f"The folder {disk_path} does not exist. Creating the folder.", webhook_url)
+                    os.makedirs(disk_path)
 
             print_and_discord("\nScript started with the following configuration:", webhook_url)
             for source_folder in valid_src_folders:
                 print_and_discord(f"Source folder: {source_folder}", webhook_url)
             for disk in disks:
-                name = disk.get('naam') or disk.get('name')
-                path = disk.get('pad') or disk.get('path')
+                name = disk['name']
+                path = disk['path']
                 print_and_discord(f"Disk {name}: {path}", webhook_url)
             print_and_discord(f"Last used disk: {last_disk}", webhook_url)
 
@@ -1277,7 +1296,7 @@ def main():
                     print_and_discord(f"Checking source folder: {source_folder}", webhook_url)
                     last_disk = check_files_and_move(
                         source_folder,
-                        [{'name': d.get('naam') or d.get('name'), 'path': d.get('pad') or d.get('path')} for d in disks],
+                        disks,
                         last_disk,
                         webhook_url,
                         min_file_age_hours,
