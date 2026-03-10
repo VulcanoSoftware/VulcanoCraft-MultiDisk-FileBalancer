@@ -457,6 +457,7 @@ def save_config_if_missing(config_data, config_path=config_path):
         return
 
     src = config_data.get('src', '')
+    src_folders = config_data.get('src_folders', [])
     webhook_url = config_data.get('webhook_url', '')
     disks = config_data.get('disks', [])
     last_disk = config_data.get('last_disk', '')
@@ -509,6 +510,16 @@ def save_config_if_missing(config_data, config_path=config_path):
     lines.append("# end up. The script automatically distributes these files")
     lines.append("# over the configured disks.")
     lines.append(f"src: {src}")
+    lines.append("")
+    lines.append("# src_folders:")
+    lines.append("# List of multiple input folders. If this is used, the 'src' value")
+    lines.append("# above is typically used as the first entry or default.")
+    lines.append("src_folders:")
+    if src_folders:
+        for folder in src_folders:
+            lines.append(f"  - {folder}")
+    else:
+        lines.append(f"  - {src}")
     lines.append("")
     lines.append("# webhook_url:")
     lines.append("# Optional: a Discord webhook URL for notifications.")
@@ -999,15 +1010,28 @@ def main():
 
     print("Config loaded from config.yml (or default values used when missing):")
 
-    src_folders_config = config.get('src_folders')
+    src_folders_config = config.get('src_folders', [])
     src_from_config = config.get('src', '')
     src_folders = []
 
-    if src_folders_config:
-        src_folders = [path for path in src_folders_config if path]
-    elif config_exists and src_from_config:
-        src_folders = [src_from_config]
-    else:
+    # Use a list to keep folders unique while preserving order
+    def add_unique_folder(path):
+        if path and path not in src_folders:
+            src_folders.append(path)
+
+    # 1. Add 'src' from config if it exists
+    if src_from_config:
+        add_unique_folder(src_from_config)
+
+    # 2. Add all 'src_folders' from config
+    if isinstance(src_folders_config, list):
+        for path in src_folders_config:
+            add_unique_folder(path)
+    elif src_folders_config:
+        add_unique_folder(src_folders_config)
+
+    # 3. If still no folders and it's a first run, ask the user
+    if not src_folders and not config_exists:
         try:
             num_input_folders = int(input("How many input folders do you want to configure? "))
         except ValueError:
@@ -1015,19 +1039,15 @@ def main():
         if num_input_folders < 1:
             num_input_folders = 1
         for i in range(num_input_folders):
-            if i == 0 and src_from_config:
-                src_path = src_from_config
-            else:
-                src_path = input(f"Enter the path for input folder {i + 1}: ")
-            src_folders.append(src_path)
+            src_path = input(f"Enter the path for input folder {i + 1}: ")
+            add_unique_folder(src_path)
 
+    # 4. Final fallback if nothing was provided
     if not src_folders:
-        if config_exists and src_from_config:
-            src_folders = [src_from_config]
-        else:
-            src_path = input("Enter the path for the input folder: ")
-            src_folders = [src_path]
+        src_path = input("Enter the path for the input folder: ")
+        add_unique_folder(src_path)
 
+    # The first folder in the list is used as the primary 'src' for server defaults
     src = src_folders[0]
     webhook_url = config.get('webhook_url', '')
     if not config_exists:
@@ -1259,26 +1279,15 @@ def main():
 
     while True:
         try:
-            valid_src_folders = []
-            for source_folder in src_folders:
-                if os.path.exists(source_folder):
-                    valid_src_folders.append(source_folder)
-                else:
-                    print_and_discord(f"The source folder {source_folder} does not exist.", webhook_url)
-
-            if not valid_src_folders:
-                print_and_discord("No valid input folders found. Check the paths in config.yml or at startup.", webhook_url)
-                input("Press Enter to try again...")
-                continue
-
+            # Re-check disks existence
             for disk in disks:
                 disk_path = disk['path']
                 if not os.path.exists(disk_path):
                     print_and_discord(f"The folder {disk_path} does not exist. Creating the folder.", webhook_url)
-                    os.makedirs(disk_path)
+                    os.makedirs(disk_path, exist_ok=True)
 
             print_and_discord("\nScript started with the following configuration:", webhook_url)
-            for source_folder in valid_src_folders:
+            for source_folder in src_folders:
                 print_and_discord(f"Source folder: {source_folder}", webhook_url)
             for disk in disks:
                 name = disk['name']
@@ -1292,7 +1301,13 @@ def main():
             reverse_interval = timedelta(minutes=reverse_interval_minutes)
             while True:
                 print_and_discord("======================================================", webhook_url)
-                for source_folder in valid_src_folders:
+                found_any_valid_src = False
+                for source_folder in src_folders:
+                    if not os.path.exists(source_folder):
+                        print_and_discord(f"Checking source folder: {source_folder} (DOES NOT EXIST, skipping)", webhook_url)
+                        continue
+
+                    found_any_valid_src = True
                     print_and_discord(f"Checking source folder: {source_folder}", webhook_url)
                     last_disk = check_files_and_move(
                         source_folder,
@@ -1302,6 +1317,9 @@ def main():
                         min_file_age_hours,
                         extra_safety_space_gb,
                     )
+                if not found_any_valid_src:
+                    print_and_discord("No valid input folders found in this cycle.", webhook_url)
+
                 if space_hunter_disks:
                     check_and_cleanup_disks(
                         space_hunter_disks,

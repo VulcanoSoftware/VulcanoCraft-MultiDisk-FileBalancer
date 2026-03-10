@@ -21,6 +21,14 @@
 # over the configured disks.
 src: C:\Users\user\Downloads\raid-0-sim-main\src1
 
+# src_folders:
+# Optional: List of multiple input folders.
+# If both 'src' and 'src_folders' are present, the script will scan
+# all of them. The folders will be scanned in the order they appear.
+# src_folders:
+#   - C:\Users\user\Downloads\raid-0-sim-main\src1
+#   - C:\Users\user\Downloads\raid-0-sim-main\src2
+
 # webhook_url:
 # Optional: a Discord webhook URL for notifications.
 # - Leave empty ('') to disable Discord notifications.
