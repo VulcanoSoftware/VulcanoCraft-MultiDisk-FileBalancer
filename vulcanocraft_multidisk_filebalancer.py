@@ -11,15 +11,52 @@ from urllib.parse import unquote, urlparse, parse_qs
 import asyncssh
 import stat
 import errno
+import sys
 from asyncssh.sftp import SFTPName, SFTPAttrs, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC
 
-try:
-    from fuse import FUSE, Operations, FuseOSError
-except (ImportError, OSError):
-    FUSE = None
-    Operations = object
-    class FuseOSError(Exception):
-        pass
+def try_import_fuse():
+    global FUSE, Operations, FuseOSError
+    try:
+        from fuse import FUSE, Operations, FuseOSError
+        return True
+    except (ImportError, OSError):
+        FUSE = None
+        Operations = object
+        class FuseOSError(Exception):
+            pass
+        return False
+
+FUSE = None
+Operations = object
+class FuseOSError(Exception):
+    pass
+
+try_import_fuse()
+
+def install_libfuse():
+    import platform
+    import subprocess
+    system = platform.system().lower()
+    print(f"Attempting to install libfuse for {system}...")
+    try:
+        if system == "linux":
+            # Try apt (Debian/Ubuntu)
+            subprocess.run(["sudo", "apt-get", "update"], check=True)
+            subprocess.run(["sudo", "apt-get", "install", "-y", "libfuse2"], check=True)
+        elif system == "windows":
+            # Try winget for WinFsp
+            subprocess.run(["winget", "install", "WinFsp.WinFsp"], check=True)
+        elif system == "darwin":
+            # Try brew for macfuse
+            subprocess.run(["brew", "install", "--cask", "macfuse"], check=True)
+
+        # Also ensure fusepy is installed
+        subprocess.run([sys.executable, "-m", "pip", "install", "fusepy"], check=True)
+
+        return try_import_fuse()
+    except Exception as e:
+        print(f"Automatic installation failed: {e}")
+        return False
 
 current_dir = os.getcwd()
 config_path = os.path.join(current_dir, "config.yml")
@@ -462,85 +499,87 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     threading.Thread(target=run_server, daemon=True).start()
 
-class VirtualFUSE(Operations):
-    def __init__(self, upload_src_path):
-        self.upload_src_path = upload_src_path
-        os.makedirs(self.upload_src_path, exist_ok=True)
+def create_virtual_fuse_class():
+    class VirtualFUSE(Operations):
+        def __init__(self, upload_src_path):
+            self.upload_src_path = upload_src_path
+            os.makedirs(self.upload_src_path, exist_ok=True)
 
-    def getattr(self, path, fh=None):
-        is_file, is_dir, physical_path = get_virtual_item_info(path)
-        if physical_path and os.path.exists(physical_path):
-            st = os.lstat(physical_path)
-            return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                         'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-        if is_dir:
-            mode = stat.S_IFDIR | 0o755
-            now = time.time()
-            return {
-                'st_atime': now, 'st_ctime': now, 'st_mtime': now,
-                'st_gid': os.getgid() if hasattr(os, 'getgid') else 0,
-                'st_uid': os.getuid() if hasattr(os, 'getuid') else 0,
-                'st_mode': mode, 'st_nlink': 2, 'st_size': 0
-            }
-        raise FuseOSError(errno.ENOENT)
-
-    def readdir(self, path, fh):
-        names = list_virtual_dir(path)
-        dirents = ['.', '..']
-        dirents.extend(names.keys())
-        for r in dirents:
-            yield r
-
-    def open(self, path, flags):
-        is_file, is_dir, physical_path = get_virtual_item_info(path)
-        if not physical_path or not os.path.exists(physical_path):
-            raise FuseOSError(errno.ENOENT)
-        return os.open(physical_path, flags)
-
-    def create(self, path, mode, fi=None):
-        name = path.strip('/').split('/')[-1]
-        if not name:
-            raise FuseOSError(errno.EINVAL)
-        physical_path = os.path.join(self.upload_src_path, name)
-        fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        map_virtual_path(path, physical_path)
-        return fd
-
-    def read(self, path, length, offset, fh):
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.read(fh, length)
-
-    def write(self, path, buf, offset, fh):
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.write(fh, buf)
-
-    def truncate(self, path, length, fh=None):
-        is_file, is_dir, physical_path = get_virtual_item_info(path)
-        if physical_path:
-            with open(physical_path, 'r+b') as f:
-                f.truncate(length)
-
-    def flush(self, path, fh):
-        return os.fsync(fh)
-
-    def release(self, path, fh):
-        return os.close(fh)
-
-    def unlink(self, path):
-        physical_path = remove_virtual_file(path)
-        if physical_path and os.path.exists(physical_path):
-            os.remove(physical_path)
-        else:
+        def getattr(self, path, fh=None):
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
+            if physical_path and os.path.exists(physical_path):
+                st = os.lstat(physical_path)
+                return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+            if is_dir:
+                mode = stat.S_IFDIR | 0o755
+                now = time.time()
+                return {
+                    'st_atime': now, 'st_ctime': now, 'st_mtime': now,
+                    'st_gid': os.getgid() if hasattr(os, 'getgid') else 0,
+                    'st_uid': os.getuid() if hasattr(os, 'getuid') else 0,
+                    'st_mode': mode, 'st_nlink': 2, 'st_size': 0
+                }
             raise FuseOSError(errno.ENOENT)
 
-    def rmdir(self, path):
-        # We don't really support virtual directories that are not backed by physical ones
-        # or empty virtual directories.
-        raise FuseOSError(errno.EPERM)
+        def readdir(self, path, fh):
+            names = list_virtual_dir(path)
+            dirents = ['.', '..']
+            dirents.extend(names.keys())
+            for r in dirents:
+                yield r
 
-    def mkdir(self, path, mode):
-        # Everything is flat in the current implementation
-        raise FuseOSError(errno.EPERM)
+        def open(self, path, flags):
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
+            if not physical_path or not os.path.exists(physical_path):
+                raise FuseOSError(errno.ENOENT)
+            return os.open(physical_path, flags)
+
+        def create(self, path, mode, fi=None):
+            name = path.strip('/').split('/')[-1]
+            if not name:
+                raise FuseOSError(errno.EINVAL)
+            physical_path = os.path.join(self.upload_src_path, name)
+            fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            map_virtual_path(path, physical_path)
+            return fd
+
+        def read(self, path, length, offset, fh):
+            os.lseek(fh, offset, os.SEEK_SET)
+            return os.read(fh, length)
+
+        def write(self, path, buf, offset, fh):
+            os.lseek(fh, offset, os.SEEK_SET)
+            return os.write(fh, buf)
+
+        def truncate(self, path, length, fh=None):
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
+            if physical_path:
+                with open(physical_path, 'r+b') as f:
+                    f.truncate(length)
+
+        def flush(self, path, fh):
+            return os.fsync(fh)
+
+        def release(self, path, fh):
+            return os.close(fh)
+
+        def unlink(self, path):
+            physical_path = remove_virtual_file(path)
+            if physical_path and os.path.exists(physical_path):
+                os.remove(physical_path)
+            else:
+                raise FuseOSError(errno.ENOENT)
+
+        def rmdir(self, path):
+            # We don't really support virtual directories that are not backed by physical ones
+            # or empty virtual directories.
+            raise FuseOSError(errno.EPERM)
+
+        def mkdir(self, path, mode):
+            # Everything is flat in the current implementation
+            raise FuseOSError(errno.EPERM)
+    return VirtualFUSE
 
 
 def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
@@ -560,7 +599,8 @@ def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
     def run_fuse():
         try:
             print_and_discord(f"Starting FUSE mount at {mount_point}", webhook_url)
-            FUSE(VirtualFUSE(upload_src_path), mount_point, nothreads=True, foreground=True)
+            cls = create_virtual_fuse_class()
+            FUSE(cls(upload_src_path), mount_point, nothreads=True, foreground=True)
         except Exception as e:
             print_and_discord(f"FUSE mount failed: {e}", webhook_url)
 
@@ -1317,11 +1357,10 @@ def main():
         print("\nFUSE local mount:")
         print("- Allows you to mount the virtual disk locally.")
         print("- Requires libfuse and 'fusepy' to be installed.")
-        use_fuse = False
-        if FUSE is not None:
-            use_fuse = input("Do you want to enable the FUSE local mount? (yes/no): ").strip().lower() == 'yes'
-        else:
-            print("FUSE support not available (fusepy not installed or libfuse missing). Skipping FUSE configuration.")
+        if FUSE is None:
+            print("- Currently NOT detected. If enabled, an automatic installation attempt will be made.")
+
+        use_fuse = input("Do you want to enable the FUSE local mount? (yes/no): ").strip().lower() == 'yes'
 
         if use_fuse:
             default_fuse_mount = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
@@ -1420,6 +1459,13 @@ def main():
     start_sftp_server_thread(sftp_server_config, sftp_upload_src, webhook_url)
 
     fuse_enabled = fuse_server_config.get('enabled', False)
+    if fuse_enabled and FUSE is None:
+        print_and_discord("FUSE support requested but libfuse is missing. Attempting automatic installation...", webhook_url)
+        if install_libfuse():
+            print_and_discord("FUSE support installed successfully!", webhook_url)
+        else:
+            print_and_discord("Automatic FUSE installation failed. You may need to install it manually.", webhook_url)
+
     fuse_upload_src = fuse_server_config.get('upload_src', src)
     if fuse_enabled and fuse_upload_src and fuse_upload_src not in src_folders:
         src_folders.append(fuse_upload_src)
