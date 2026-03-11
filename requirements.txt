@@ -2,3 +2,4 @@ pyyaml
 requests
 asyncssh
 
+fusepy
