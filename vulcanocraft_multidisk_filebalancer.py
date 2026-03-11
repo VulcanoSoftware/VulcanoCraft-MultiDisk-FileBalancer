@@ -394,16 +394,22 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     class SimpleSSHServer(asyncssh.SSHServer):
         def begin_auth(self, username):
+            print_and_discord(f"SFTP: Login attempt for user '{username}'", webhook_url)
             return True
 
         def password_auth_supported(self):
             return True
 
         def validate_password(self, username, password):
-            return username == username_cfg and password == password_cfg
+            if username == username_cfg and password == password_cfg:
+                print_and_discord(f"SFTP: Login successful for user '{username}'", webhook_url)
+                return True
+            print_and_discord(f"SFTP: Login failed for user '{username}' (incorrect credentials)", webhook_url)
+            return False
 
     class SimpleSFTPServer(asyncssh.SFTPServer):
         def __init__(self, chan):
+            print_and_discord(f"SFTP: Session started on channel {chan}", webhook_url)
             self._upload_src_path = upload_src_path
             os.makedirs(self._upload_src_path, exist_ok=True)
             self._dir_handles = {}
@@ -425,18 +431,24 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             return self._normalize_virtual(path)
 
         async def stat(self, path, follow_symlinks=True):
-            virt = self._normalize_virtual(path)
-            if virt == '/..':
-                virt = '/'
-            is_file, is_dir, physical_path = get_virtual_item_info(virt)
-            if physical_path and os.path.exists(physical_path):
-                st = os.stat(physical_path)
-                return SFTPAttrs.from_local(st)
-            if is_dir:
-                mode = stat.S_IFDIR | 0o755
-                now = int(time.time())
-                return SFTPAttrs(permissions=mode, atime=now, mtime=now)
-            raise asyncssh.SFTPNoSuchFile(virt)
+            try:
+                virt = self._normalize_virtual(path)
+                if virt == '/..':
+                    virt = '/'
+                is_file, is_dir, physical_path = get_virtual_item_info(virt)
+                if physical_path and os.path.exists(physical_path):
+                    st = os.stat(physical_path)
+                    return SFTPAttrs.from_local(st)
+                if is_dir:
+                    mode = stat.S_IFDIR | 0o755
+                    now = int(time.time())
+                    return SFTPAttrs(permissions=mode, atime=now, mtime=now)
+                raise asyncssh.SFTPNoSuchFile(virt)
+            except Exception as e:
+                if isinstance(e, asyncssh.SFTPNoSuchFile):
+                    raise
+                print_and_discord(f"SFTP: Stat error for {path}: {e}", webhook_url)
+                raise asyncssh.SFTPNoSuchFile(str(path))
 
         async def lstat(self, path):
             return await self.stat(path, follow_symlinks=False)
@@ -517,15 +529,22 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             virt = self._normalize_virtual(path)
             write = bool(pflags & FXF_WRITE) or bool(pflags & FXF_CREAT)
             if write:
-                physical_path = self._safe_join(self._upload_src_path, virt)
-                os.makedirs(os.path.dirname(physical_path), exist_ok=True)
-                map_virtual_path(virt, physical_path)
+                try:
+                    physical_path = self._safe_join(self._upload_src_path, virt)
+                    os.makedirs(os.path.dirname(physical_path), exist_ok=True)
+                    map_virtual_path(virt, physical_path)
+                except Exception as e:
+                    raise asyncssh.SFTPPermissionDenied(str(e))
             else:
                 physical_path = get_physical_path_for_virtual(virt)
                 if not physical_path or not os.path.exists(physical_path):
                     raise asyncssh.SFTPNoSuchFile(virt)
+
             mode = self._mode_from_pflags(pflags)
-            return open(physical_path, mode)
+            try:
+                return open(physical_path, mode)
+            except Exception as e:
+                raise asyncssh.SFTPFailure(str(e))
 
         async def remove(self, path):
             virt = self._normalize_virtual(path)
@@ -573,23 +592,31 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 raise asyncssh.SFTPFailure(str(e))
 
     async def start_server():
-        server_host_keys = None
+        server_host_keys = []
         if host_key_path and os.path.exists(host_key_path):
             server_host_keys = [host_key_path]
         else:
-            try:
-                generated_key = asyncssh.generate_private_key('ssh-ed25519')
-                server_host_keys = [generated_key]
-            except Exception:
-                server_host_keys = None
+            # Generate multiple types of keys for better compatibility
+            for alg in ['ssh-ed25519', 'ssh-rsa']:
+                try:
+                    server_host_keys.append(asyncssh.generate_private_key(alg))
+                except Exception:
+                    pass
 
-        await asyncssh.listen(
-            host,
-            port,
-            server_factory=SimpleSSHServer,
-            server_host_keys=server_host_keys,
-            sftp_factory=SimpleSFTPServer,
-        )
+        if not server_host_keys:
+            server_host_keys = None
+
+        try:
+            await asyncssh.listen(
+                host,
+                port,
+                server_factory=SimpleSSHServer,
+                server_host_keys=server_host_keys,
+                sftp_factory=SimpleSFTPServer,
+            )
+        except Exception as e:
+            print_and_discord(f"SFTP: Failed to listen on {host}:{port}: {e}", webhook_url)
+            raise
 
     def run_server():
         try:
@@ -649,12 +676,13 @@ def create_virtual_fuse_class():
         def create(self, path, mode, fi=None):
             try:
                 physical_path = self._safe_join(self.upload_src_path, path)
-            except FuseOSError:
+                os.makedirs(os.path.dirname(physical_path), exist_ok=True)
+                fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+                map_virtual_path(path, physical_path)
+                return fd
+            except Exception as e:
+                print(f"FUSE create error: {e}")
                 raise FuseOSError(errno.EPERM)
-            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
-            fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-            map_virtual_path(path, physical_path)
-            return fd
 
         def read(self, path, length, offset, fh):
             os.lseek(fh, offset, os.SEEK_SET)
