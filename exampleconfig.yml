@@ -235,3 +235,22 @@ sftp_server:
   username: 'user'
   password: 'password123'
   upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
+
+######################################################################
+# FUSE SERVER FOR VIRTUAL DISK
+######################################################################
+#
+# With "fuse_server" you can mount the virtual disk locally on your
+# machine. This allows you to access all files across all disks as
+# if they are in one single folder.
+#
+# Important points:
+# - This requires 'libfuse' to be installed on your system.
+# - The mount_point is the local folder where the virtual disk
+#   will be attached.
+# - Everything you put into the mount point will be picked up
+#   by the FileBalancer (via the upload_src folder).
+fuse_server:
+  enabled: false
+  mount_point: C:\Users\user\Downloads\raid-0-sim-main\mount
+  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
