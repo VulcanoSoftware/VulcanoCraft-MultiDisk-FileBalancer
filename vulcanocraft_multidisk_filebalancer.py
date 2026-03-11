@@ -219,28 +219,33 @@ def list_virtual_dir(virtual_dir):
     return children
 
 
-def initialize_virtual_index_from_disks(disks):
+def initialize_virtual_index(folders):
+    """Recursively populates the virtual index from a list of physical folders."""
     changed = False
-    for disk in disks:
-        path = disk.get('path')
-        if not path or not os.path.isdir(path):
+    for folder_path in folders:
+        if not folder_path or not os.path.isdir(folder_path):
             continue
-        try:
-            names = os.listdir(path)
-        except Exception:
-            continue
-        for name in names:
-            physical_path = os.path.join(path, name)
-            if not os.path.isfile(physical_path):
-                continue
-            with virtual_index_lock:
-                if physical_path in virtual_index['files'].values():
-                    continue
-                virtual_path = '/' + name
-                if virtual_path in virtual_index['files']:
-                    continue
-                virtual_index['files'][virtual_path] = physical_path
-                changed = True
+
+        for root, dirs, files in os.walk(folder_path):
+            for name in files:
+                physical_path = os.path.join(root, name)
+
+                # Determine virtual path relative to the disk/source root
+                rel_path = os.path.relpath(physical_path, folder_path)
+                virtual_path = '/' + rel_path.replace(os.sep, '/')
+                virtual_path = normalize_virtual_path(virtual_path)
+
+                with virtual_index_lock:
+                    # Avoid duplicates: check if physical path already indexed
+                    if physical_path in virtual_index['files'].values():
+                        continue
+                    # Avoid virtual collisions: first one wins
+                    if virtual_path in virtual_index['files']:
+                        continue
+
+                    virtual_index['files'][virtual_path] = physical_path
+                    changed = True
+
     if changed:
         write_virtual_index()
 
@@ -401,6 +406,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         def __init__(self, chan):
             self._upload_src_path = upload_src_path
             os.makedirs(self._upload_src_path, exist_ok=True)
+            self._dir_handles = {}
             super().__init__(chan)
 
         def _normalize_virtual(self, path):
@@ -412,44 +418,68 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 return '/'
             return normalize_virtual_path(path_str)
 
-        def canonicalize(self, path):
-            virt = self._normalize_virtual(path)
-            return virt.encode('utf-8')
+        async def canonicalize(self, path):
+            return self._normalize_virtual(path)
 
-        def realpath(self, path):
-            virt = self._normalize_virtual(path)
-            return virt.encode('utf-8')
-
-        def listdir(self, path):
-            virt_dir = self._normalize_virtual(path)
-            names = list_virtual_dir(virt_dir)
-            result = []
-            for name, full_virtual in sorted(names.items()):
-                is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
-                if physical_path and os.path.exists(physical_path):
-                    st = os.stat(physical_path)
-                    attrs = SFTPAttrs.from_local(st)
-                else:
-                    mode = stat.S_IFDIR | 0o755 if is_dir else stat.S_IFREG | 0o644
-                    now = int(time.time())
-                    attrs = SFTPAttrs(
-                        permissions=mode,
-                        atime=now,
-                        mtime=now,
-                    )
-                result.append(SFTPName(name.encode('utf-8'), '', attrs))
-            return result
+        async def realpath(self, path):
+            return self._normalize_virtual(path)
 
         async def stat(self, path, follow_symlinks=True):
             virt = self._normalize_virtual(path)
+            if virt == '/..':
+                virt = '/'
             is_file, is_dir, physical_path = get_virtual_item_info(virt)
             if physical_path and os.path.exists(physical_path):
-                return os.stat(physical_path)
+                st = os.stat(physical_path)
+                return SFTPAttrs.from_local(st)
             if is_dir:
                 mode = stat.S_IFDIR | 0o755
                 now = int(time.time())
-                return os.stat_result((mode, 0, 0, 0, 0, 0, 0, now, now, now))
+                return SFTPAttrs(permissions=mode, atime=now, mtime=now)
             raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def lstat(self, path):
+            return await self.stat(path, follow_symlinks=False)
+
+        async def opendir(self, path):
+            virt = self._normalize_virtual(path)
+            is_file, is_dir, physical_path = get_virtual_item_info(virt)
+            if not is_dir:
+                raise asyncssh.SFTPNoSuchFile(virt)
+
+            names = list_virtual_dir(virt)
+            entries = []
+            now = int(time.time())
+            entries.append(SFTPName('.', attrs=SFTPAttrs(permissions=stat.S_IFDIR|0o755, atime=now, mtime=now)))
+            entries.append(SFTPName('..', attrs=SFTPAttrs(permissions=stat.S_IFDIR|0o755, atime=now, mtime=now)))
+            for name, full_virtual in sorted(names.items()):
+                v_is_file, v_is_dir, v_physical_path = get_virtual_item_info(full_virtual)
+                if v_physical_path and os.path.exists(v_physical_path):
+                    st = os.stat(v_physical_path)
+                    attrs = SFTPAttrs.from_local(st)
+                else:
+                    mode = stat.S_IFDIR | 0o755 if v_is_dir else stat.S_IFREG | 0o644
+                    now = int(time.time())
+                    attrs = SFTPAttrs(permissions=mode, atime=now, mtime=now)
+                entries.append(SFTPName(name, attrs=attrs))
+
+            handle = os.urandom(8)
+            self._dir_handles[handle] = entries
+            return handle
+
+        async def readdir(self, handle):
+            entries = self._dir_handles.get(handle)
+            if entries is None:
+                raise asyncssh.SFTPInvalidHandle()
+            if not entries:
+                return None
+
+            chunk = entries[:100]
+            self._dir_handles[handle] = entries[100:]
+            return chunk
+
+        async def closedir(self, handle):
+            self._dir_handles.pop(handle, None)
 
         def _mode_from_pflags(self, pflags):
             read = bool(pflags & FXF_READ)
@@ -473,30 +503,74 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 return 'r+b'
             return 'rb'
 
+        def _safe_join(self, base, virtual_path):
+            # Strip leading slashes and normalize the path
+            rel_path = virtual_path.lstrip('/')
+            # Use os.path.normpath to resolve any '..' components
+            safe_rel_path = os.path.normpath(rel_path)
+            # Check if the normalized relative path attempts to go outside the base
+            if safe_rel_path.startswith('..') or os.path.isabs(safe_rel_path):
+                 raise asyncssh.SFTPPermissionDenied('Illegal path')
+            return os.path.join(base, safe_rel_path.replace('/', os.sep))
+
         async def open(self, path, pflags, attrs):
             virt = self._normalize_virtual(path)
-            write = bool(pflags & FXF_WRITE)
+            write = bool(pflags & FXF_WRITE) or bool(pflags & FXF_CREAT)
             if write:
-                name = virt.strip('/').split('/')[-1]
-                if not name:
-                    raise asyncssh.SFTPFailure('Invalid file name')
-                physical_path = os.path.join(self._upload_src_path, name)
+                physical_path = self._safe_join(self._upload_src_path, virt)
+                os.makedirs(os.path.dirname(physical_path), exist_ok=True)
                 map_virtual_path(virt, physical_path)
             else:
                 physical_path = get_physical_path_for_virtual(virt)
                 if not physical_path or not os.path.exists(physical_path):
                     raise asyncssh.SFTPNoSuchFile(virt)
             mode = self._mode_from_pflags(pflags)
-            f = open(physical_path, mode)
-            return f
+            return open(physical_path, mode)
 
         async def remove(self, path):
             virt = self._normalize_virtual(path)
             physical_path = remove_virtual_file(virt)
             if physical_path and os.path.exists(physical_path):
-                os.remove(physical_path)
+                try:
+                    os.remove(physical_path)
+                except Exception as e:
+                    raise asyncssh.SFTPFailure(str(e))
                 return
             raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def rmdir(self, path):
+            virt = self._normalize_virtual(path)
+            physical_path = self._safe_join(self._upload_src_path, virt)
+            if os.path.isdir(physical_path):
+                try:
+                    os.rmdir(physical_path)
+                except Exception as e:
+                    raise asyncssh.SFTPFailure(str(e))
+            else:
+                raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def mkdir(self, path, attrs):
+            virt = self._normalize_virtual(path)
+            physical_path = self._safe_join(self._upload_src_path, virt)
+            try:
+                os.makedirs(physical_path, exist_ok=True)
+            except Exception as e:
+                raise asyncssh.SFTPFailure(str(e))
+
+        async def rename(self, old_path, new_path):
+            old_virt = self._normalize_virtual(old_path)
+            new_virt = self._normalize_virtual(new_path)
+            old_phys = get_physical_path_for_virtual(old_virt)
+            if not old_phys or not os.path.exists(old_phys):
+                raise asyncssh.SFTPNoSuchFile(old_virt)
+            new_phys = self._safe_join(self._upload_src_path, new_virt)
+            try:
+                os.makedirs(os.path.dirname(new_phys), exist_ok=True)
+                os.rename(old_phys, new_phys)
+                remove_virtual_file(old_virt)
+                map_virtual_path(new_virt, new_phys)
+            except Exception as e:
+                raise asyncssh.SFTPFailure(str(e))
 
     async def start_server():
         server_host_keys = None
@@ -565,11 +639,19 @@ def create_virtual_fuse_class():
                 raise FuseOSError(errno.ENOENT)
             return os.open(physical_path, flags)
 
+        def _safe_join(self, base, path):
+            rel_path = path.lstrip('/')
+            safe_rel_path = os.path.normpath(rel_path)
+            if safe_rel_path.startswith('..') or os.path.isabs(safe_rel_path):
+                raise FuseOSError(errno.EPERM)
+            return os.path.join(base, safe_rel_path.replace('/', os.sep))
+
         def create(self, path, mode, fi=None):
-            name = path.strip('/').split('/')[-1]
-            if not name:
-                raise FuseOSError(errno.EINVAL)
-            physical_path = os.path.join(self.upload_src_path, name)
+            try:
+                physical_path = self._safe_join(self.upload_src_path, path)
+            except FuseOSError:
+                raise FuseOSError(errno.EPERM)
+            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
             fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
             map_virtual_path(path, physical_path)
             return fd
@@ -1474,7 +1556,14 @@ def main():
             new_config['reverse_raid'] = reverse_raid_config
         save_config_if_missing(new_config, config_path=config_path)
 
-    initialize_virtual_index_from_disks(disks)
+    # Unified list of folders to index
+    folders_to_index = list(src_folders)
+    for disk in disks:
+        dpath = disk.get('path')
+        if dpath and dpath not in folders_to_index:
+            folders_to_index.append(dpath)
+
+    initialize_virtual_index(folders_to_index)
 
     s3_enabled = s3_server_config.get('enabled', False)
     s3_upload_src = s3_server_config.get('upload_src', src)
