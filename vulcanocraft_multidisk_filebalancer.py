@@ -10,83 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
 import asyncssh
 import stat
-import errno
-import sys
 from asyncssh.sftp import SFTPName, SFTPAttrs, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC
-
-def try_import_fuse():
-    global FUSE, Operations, FuseOSError
-    try:
-        from fuse import FUSE, Operations, FuseOSError
-        return True
-    except (ImportError, OSError):
-        FUSE = None
-        Operations = object
-        class FuseOSError(Exception):
-            pass
-        return False
-
-FUSE = None
-Operations = object
-class FuseOSError(Exception):
-    pass
-
-try_import_fuse()
-
-def install_libfuse():
-    import platform
-    import subprocess
-    import shutil
-    system = platform.system().lower()
-    print(f"Attempting to install libfuse for {system}...")
-
-    def run_cmd(cmd, shell=False):
-        subprocess.run(cmd, check=True, shell=shell)
-
-    try:
-        if system == "linux":
-            if shutil.which("apt-get"):
-                run_cmd(["sudo", "apt-get", "update"])
-                run_cmd(["sudo", "apt-get", "install", "-y", "libfuse2"])
-            elif shutil.which("dnf"):
-                run_cmd(["sudo", "dnf", "install", "-y", "fuse-libs"])
-            elif shutil.which("pacman"):
-                run_cmd(["sudo", "pacman", "-S", "--noconfirm", "fuse2"])
-            else:
-                print("No supported package manager (apt, dnf, pacman) found on Linux.")
-                return False
-
-        elif system == "windows":
-            if shutil.which("winget"):
-                run_cmd(["winget", "install", "--id", "WinFsp.WinFsp", "--accept-package-agreements", "--accept-source-agreements"])
-            else:
-                print("winget not found. Attempting direct installation of WinFsp via PowerShell...")
-                # WinFsp v2.0 release
-                winfsp_url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
-                ps_cmd = f"Invoke-WebRequest -Uri {winfsp_url} -OutFile winfsp.msi; Start-Process msiexec.exe -ArgumentList '/i winfsp.msi /quiet /norestart' -Wait; Remove-Item winfsp.msi"
-                run_cmd(["powershell", "-Command", ps_cmd])
-
-        elif system == "darwin":
-            if shutil.which("brew"):
-                run_cmd(["brew", "install", "--cask", "macfuse"])
-            else:
-                print("Homebrew not found. Attempting direct installation of macFUSE...")
-                # macFUSE v4.8.3
-                macfuse_url = "https://github.com/osxfuse/osxfuse/releases/download/macfuse-4.8.3/macfuse-4.8.3.dmg"
-                run_cmd(["curl", "-L", "-o", "macfuse.dmg", macfuse_url])
-                run_cmd(["hdiutil", "attach", "macfuse.dmg"])
-                # We expect the volume name to be macFUSE
-                run_cmd(r"sudo installer -pkg /Volumes/macFUSE/Install\ macFUSE.pkg -target /", shell=True)
-                run_cmd(["hdiutil", "detach", "/Volumes/macFUSE"])
-                run_cmd(["rm", "macfuse.dmg"])
-
-        # Also ensure fusepy is installed
-        subprocess.run([sys.executable, "-m", "pip", "install", "fusepy"], check=True)
-
-        return try_import_fuse()
-    except Exception as e:
-        print(f"Automatic installation failed: {e}")
-        return False
 
 current_dir = os.getcwd()
 config_path = os.path.join(current_dir, "config.yml")
@@ -163,60 +87,6 @@ def update_virtual_index_after_move(old_path, new_path):
                 changed = True
         if changed:
             write_virtual_index()
-
-
-def get_virtual_item_info(virtual_path):
-    """Returns (is_file, is_dir, physical_path) for a virtual path."""
-    virt = normalize_virtual_path(virtual_path)
-    with virtual_index_lock:
-        physical_path = virtual_index['files'].get(virt)
-        if physical_path:
-            return True, os.path.isdir(physical_path), physical_path
-
-        # Check if it's a virtual directory
-        prefix = virt.rstrip('/') + '/'
-        is_dir = False
-        for k in virtual_index['files'].keys():
-            if k.startswith(prefix):
-                is_dir = True
-                break
-        if is_dir or virt == '/':
-            return False, True, None
-
-    return False, False, None
-
-
-def list_virtual_dir(virtual_dir):
-    """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
-    virt_dir = normalize_virtual_path(virtual_dir)
-    with virtual_index_lock:
-        keys = list(virtual_index['files'].keys())
-
-    if virt_dir == '/':
-        prefix = '/'
-        relevant = keys
-    else:
-        prefix = virt_dir.rstrip('/') + '/'
-        relevant = [k for k in keys if k.startswith(prefix)]
-
-    children = {}
-    for k in relevant:
-        if virt_dir == '/':
-            rest = k.lstrip('/')
-        else:
-            rest = k[len(prefix):]
-
-        if not rest:
-            continue
-
-        parts = rest.split('/', 1)
-        name = parts[0]
-        if not name:
-            continue
-
-        full_virtual = virt_dir.rstrip('/') + '/' + name
-        children[name] = full_virtual
-    return children
 
 
 def initialize_virtual_index_from_disks(disks):
@@ -420,13 +290,51 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             virt = self._normalize_virtual(path)
             return virt.encode('utf-8')
 
+        def _list_children(self, virt_dir):
+            with virtual_index_lock:
+                keys = list(virtual_index['files'].keys())
+            if virt_dir != '/':
+                prefix = virt_dir.rstrip('/') + '/'
+                relevant = [k for k in keys if k.startswith(prefix)]
+            else:
+                prefix = '/'
+                relevant = keys
+            names = {}
+            for k in relevant:
+                if virt_dir == '/':
+                    rest = k.lstrip('/')
+                else:
+                    rest = k[len(prefix):]
+                if not rest:
+                    continue
+                first = rest.split('/', 1)[0]
+                if not first:
+                    continue
+                full_virtual = virt_dir.rstrip('/')
+                if not full_virtual:
+                    full_virtual = ''
+                full_virtual = full_virtual + '/' + first
+                names[first] = full_virtual
+            return keys, names
+
         def listdir(self, path):
             virt_dir = self._normalize_virtual(path)
-            names = list_virtual_dir(virt_dir)
+            keys, names = self._list_children(virt_dir)
             result = []
             for name, full_virtual in sorted(names.items()):
-                is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
+                is_dir = False
+                fysiek_pad = None
+                with virtual_index_lock:
+                    physical_path = virtual_index['files'].get(full_virtual)
+                    if not physical_path:
+                        prefix = full_virtual.rstrip('/') + '/'
+                        for k in keys:
+                            if k.startswith(prefix):
+                                is_dir = True
+                                break
                 if physical_path and os.path.exists(physical_path):
+                    if os.path.isdir(physical_path):
+                        is_dir = True
                     st = os.stat(physical_path)
                     attrs = SFTPAttrs.from_local(st)
                 else:
@@ -442,10 +350,12 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
         async def stat(self, path, follow_symlinks=True):
             virt = self._normalize_virtual(path)
-            is_file, is_dir, physical_path = get_virtual_item_info(virt)
+            physical_path = get_physical_path_for_virtual(virt)
             if physical_path and os.path.exists(physical_path):
                 return os.stat(physical_path)
-            if is_dir:
+            virt_dir = virt
+            keys, names = self._list_children(virt_dir)
+            if names:
                 mode = stat.S_IFDIR | 0o755
                 now = int(time.time())
                 return os.stat_result((mode, 0, 0, 0, 0, 0, 0, now, now, now))
@@ -529,113 +439,6 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     threading.Thread(target=run_server, daemon=True).start()
 
-def create_virtual_fuse_class():
-    class VirtualFUSE(Operations):
-        def __init__(self, upload_src_path):
-            self.upload_src_path = upload_src_path
-            os.makedirs(self.upload_src_path, exist_ok=True)
-
-        def getattr(self, path, fh=None):
-            is_file, is_dir, physical_path = get_virtual_item_info(path)
-            if physical_path and os.path.exists(physical_path):
-                st = os.lstat(physical_path)
-                return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-            if is_dir:
-                mode = stat.S_IFDIR | 0o755
-                now = time.time()
-                return {
-                    'st_atime': now, 'st_ctime': now, 'st_mtime': now,
-                    'st_gid': os.getgid() if hasattr(os, 'getgid') else 0,
-                    'st_uid': os.getuid() if hasattr(os, 'getuid') else 0,
-                    'st_mode': mode, 'st_nlink': 2, 'st_size': 0
-                }
-            raise FuseOSError(errno.ENOENT)
-
-        def readdir(self, path, fh):
-            names = list_virtual_dir(path)
-            dirents = ['.', '..']
-            dirents.extend(names.keys())
-            for r in dirents:
-                yield r
-
-        def open(self, path, flags):
-            is_file, is_dir, physical_path = get_virtual_item_info(path)
-            if not physical_path or not os.path.exists(physical_path):
-                raise FuseOSError(errno.ENOENT)
-            return os.open(physical_path, flags)
-
-        def create(self, path, mode, fi=None):
-            name = path.strip('/').split('/')[-1]
-            if not name:
-                raise FuseOSError(errno.EINVAL)
-            physical_path = os.path.join(self.upload_src_path, name)
-            fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-            map_virtual_path(path, physical_path)
-            return fd
-
-        def read(self, path, length, offset, fh):
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.read(fh, length)
-
-        def write(self, path, buf, offset, fh):
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.write(fh, buf)
-
-        def truncate(self, path, length, fh=None):
-            is_file, is_dir, physical_path = get_virtual_item_info(path)
-            if physical_path:
-                with open(physical_path, 'r+b') as f:
-                    f.truncate(length)
-
-        def flush(self, path, fh):
-            return os.fsync(fh)
-
-        def release(self, path, fh):
-            return os.close(fh)
-
-        def unlink(self, path):
-            physical_path = remove_virtual_file(path)
-            if physical_path and os.path.exists(physical_path):
-                os.remove(physical_path)
-            else:
-                raise FuseOSError(errno.ENOENT)
-
-        def rmdir(self, path):
-            # We don't really support virtual directories that are not backed by physical ones
-            # or empty virtual directories.
-            raise FuseOSError(errno.EPERM)
-
-        def mkdir(self, path, mode):
-            # Everything is flat in the current implementation
-            raise FuseOSError(errno.EPERM)
-    return VirtualFUSE
-
-
-def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
-    if not fuse_config.get('enabled', False):
-        return
-    if FUSE is None:
-        print_and_discord("FUSE support is disabled because 'fusepy' is not installed or libfuse is missing.", webhook_url)
-        return
-
-    mount_point = fuse_config.get('mount_point')
-    if not mount_point:
-        print_and_discord("FUSE mount point not configured.", webhook_url)
-        return
-
-    os.makedirs(mount_point, exist_ok=True)
-
-    def run_fuse():
-        try:
-            print_and_discord(f"Starting FUSE mount at {mount_point}", webhook_url)
-            cls = create_virtual_fuse_class()
-            FUSE(cls(upload_src_path), mount_point, nothreads=True, foreground=True)
-        except Exception as e:
-            print_and_discord(f"FUSE mount failed: {e}", webhook_url)
-
-    threading.Thread(target=run_fuse, daemon=True).start()
-
 def get_last_modified_time(path):
     last_modified_timestamp = os.path.getmtime(path)
     last_modified_date = datetime.fromtimestamp(last_modified_timestamp)
@@ -662,7 +465,6 @@ def save_config_if_missing(config_data, config_path=config_path):
     reverse_raid_config = config_data.get('reverse_raid') or {}
     s3_server_config = config_data.get('s3_server') or {}
     sftp_server_config = config_data.get('sftp_server') or {}
-    fuse_server_config = config_data.get('fuse_server') or {}
 
     min_file_age_hours = settings.get('min_file_age_hours', 4)
     extra_safety_space_gb = settings.get('extra_safety_space_gb', 5)
@@ -683,10 +485,6 @@ def save_config_if_missing(config_data, config_path=config_path):
     sftp_username = sftp_server_config.get('username', 'raiduser')
     sftp_password = sftp_server_config.get('password', 'changeme')
     sftp_upload_src = sftp_server_config.get('upload_src', src)
-
-    fuse_enabled = fuse_server_config.get('enabled', False)
-    fuse_mount_point = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
-    fuse_upload_src = fuse_server_config.get('upload_src', src)
 
     lines = []
     lines.append("######################################################################")
@@ -943,26 +741,6 @@ def save_config_if_missing(config_data, config_path=config_path):
     lines.append(f"  password: '{sftp_password}'")
     lines.append(f"  upload_src: {sftp_upload_src}")
 
-    lines.append("")
-    lines.append("######################################################################")
-    lines.append("# FUSE SERVER FOR VIRTUAL DISK")
-    lines.append("######################################################################")
-    lines.append("#")
-    lines.append("# With \"fuse_server\" you can mount the virtual disk locally on your")
-    lines.append("# machine. This allows you to access all files across all disks as")
-    lines.append("# if they are in one single folder.")
-    lines.append("#")
-    lines.append("# Important points:")
-    lines.append("# - This requires 'libfuse' to be installed on your system.")
-    lines.append("# - The mount_point is the local folder where the virtual disk")
-    lines.append("#   will be attached.")
-    lines.append("# - Everything you put into the mount point will be picked up")
-    lines.append("#   by the FileBalancer (via the upload_src folder).")
-    lines.append("fuse_server:")
-    lines.append(f"  enabled: {'true' if fuse_enabled else 'false'}")
-    lines.append(f"  mount_point: {fuse_mount_point}")
-    lines.append(f"  upload_src: {fuse_upload_src}")
-
     with open(config_path, 'w', encoding='utf-8') as config_file:
         config_file.write("\n".join(lines) + "\n")
 
@@ -1218,7 +996,6 @@ def main():
 
     s3_server_config = config.get('s3_server', {})
     sftp_server_config = config.get('sftp_server', {})
-    fuse_server_config = config.get('fuse_server', {})
 
     print("Config loaded from config.yml (or default values used when missing):")
 
@@ -1383,31 +1160,6 @@ def main():
                 'upload_src': src,
             }
 
-        fuse_server_cfg = {}
-        print("\nFUSE local mount:")
-        print("- Allows you to mount the virtual disk locally.")
-        print("- Requires libfuse and 'fusepy' to be installed.")
-        if FUSE is None:
-            print("- Currently NOT detected. If enabled, an automatic installation attempt will be made.")
-
-        use_fuse = input("Do you want to enable the FUSE local mount? (yes/no): ").strip().lower() == 'yes'
-
-        if use_fuse:
-            default_fuse_mount = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
-            mount_input = input(f"FUSE mount point (default {default_fuse_mount}): ").strip()
-            upload_src_input = input(f"FUSE upload folder (default {src}): ").strip()
-            fuse_server_cfg = {
-                'enabled': True,
-                'mount_point': mount_input or default_fuse_mount,
-                'upload_src': upload_src_input or src,
-            }
-        else:
-            fuse_server_cfg = fuse_server_config or {
-                'enabled': False,
-                'mount_point': os.path.join(current_dir, 'mount'),
-                'upload_src': src,
-            }
-
         print("\nReverse RAID configuration:")
         use_reverse = len(src_folders) > 1
         if use_reverse:
@@ -1468,7 +1220,6 @@ def main():
             },
             's3_server': s3_server_cfg,
             'sftp_server': sftp_server_cfg,
-            'fuse_server': fuse_server_cfg,
         }
         if reverse_raid_config:
             new_config['reverse_raid'] = reverse_raid_config
@@ -1487,19 +1238,6 @@ def main():
     if sftp_enabled and sftp_upload_src and sftp_upload_src not in src_folders:
         src_folders.append(sftp_upload_src)
     start_sftp_server_thread(sftp_server_config, sftp_upload_src, webhook_url)
-
-    fuse_enabled = fuse_server_config.get('enabled', False)
-    if fuse_enabled and FUSE is None:
-        print_and_discord("FUSE support requested but libfuse is missing. Attempting automatic installation...", webhook_url)
-        if install_libfuse():
-            print_and_discord("FUSE support installed successfully!", webhook_url)
-        else:
-            print_and_discord("Automatic FUSE installation failed. You may need to install it manually.", webhook_url)
-
-    fuse_upload_src = fuse_server_config.get('upload_src', src)
-    if fuse_enabled and fuse_upload_src and fuse_upload_src not in src_folders:
-        src_folders.append(fuse_upload_src)
-    start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
     # Normalize disks: ensure every disk has both Dutch ('naam', 'pad') and English ('name', 'path') keys.
     for disk in disks:
