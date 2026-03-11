@@ -93,6 +93,10 @@ config_path = os.path.join(current_dir, "config.yml")
 virtual_index_path = os.path.join(current_dir, "virtual_index.yml")
 virtual_index_lock = threading.Lock()
 
+# Global storage for paths to support unified view across all servers
+global_src_folders = []
+global_disks = []
+
 
 def load_virtual_index():
     if os.path.exists(virtual_index_path):
@@ -139,7 +143,13 @@ def remove_virtual_file(virtual_path):
         physical = virtual_index['files'].pop(virtual, None)
         if physical:
             write_virtual_index()
+            return physical
+
+    # Fallback: find it physically in unified view
+    is_file, is_dir, physical = get_virtual_item_info(virtual)
+    if is_file and physical:
         return physical
+    return None
 
 
 def remove_virtual_file_by_physical_path(physical_path):
@@ -166,22 +176,37 @@ def update_virtual_index_after_move(old_path, new_path):
 
 
 def get_virtual_item_info(virtual_path):
-    """Returns (is_file, is_dir, physical_path) for a virtual path."""
+    """Returns (is_file, is_dir, physical_path) for a unified view of all disks."""
     virt = normalize_virtual_path(virtual_path)
+
+    # 1. Check virtual index (target disks)
     with virtual_index_lock:
         physical_path = virtual_index['files'].get(virt)
-        if physical_path:
+        if physical_path and os.path.exists(physical_path):
             return True, os.path.isdir(physical_path), physical_path
 
-        # Check if it's a virtual directory
-        prefix = virt.rstrip('/') + '/'
-        is_dir = False
+    # 2. Check all source folders and target disks physically
+    # We strip the leading slash for relative path checks
+    rel_path = virt.lstrip('/')
+
+    all_bases = global_src_folders + [d['path'] for d in global_disks]
+    for base in all_bases:
+        if not base or not os.path.isdir(base):
+            continue
+        full_physical = os.path.join(base, rel_path)
+        if os.path.exists(full_physical):
+            return os.path.isfile(full_physical), os.path.isdir(full_physical), full_physical
+
+    # 3. Check for virtual directories in the index
+    prefix = virt.rstrip('/') + '/'
+    with virtual_index_lock:
         for k in virtual_index['files'].keys():
             if k.startswith(prefix):
-                is_dir = True
-                break
-        if is_dir or virt == '/':
-            return False, True, None
+                return False, True, None
+
+    # Root is always a directory
+    if virt == '/':
+        return False, True, None
 
     return False, False, None
 
@@ -189,6 +214,25 @@ def get_virtual_item_info(virtual_path):
 def list_virtual_dir(virtual_dir):
     """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
     virt_dir = normalize_virtual_path(virtual_dir)
+    rel_dir = virt_dir.lstrip('/')
+
+    children = {}
+
+    # 1. Collect from physical disks (source and target)
+    all_bases = global_src_folders + [d['path'] for d in global_disks]
+    for base in all_bases:
+        if not base or not os.path.isdir(base):
+            continue
+        full_dir = os.path.join(base, rel_dir)
+        if os.path.isdir(full_dir):
+            try:
+                for name in os.listdir(full_dir):
+                    full_virt = virt_dir.rstrip('/') + '/' + name
+                    children[name] = full_virt
+            except Exception:
+                continue
+
+    # 2. Collect from virtual index
     with virtual_index_lock:
         keys = list(virtual_index['files'].keys())
 
@@ -199,7 +243,6 @@ def list_virtual_dir(virtual_dir):
         prefix = virt_dir.rstrip('/') + '/'
         relevant = [k for k in keys if k.startswith(prefix)]
 
-    children = {}
     for k in relevant:
         if virt_dir == '/':
             rest = k.lstrip('/')
@@ -216,6 +259,7 @@ def list_virtual_dir(virtual_dir):
 
         full_virtual = virt_dir.rstrip('/') + '/' + name
         children[name] = full_virtual
+
     return children
 
 
@@ -323,7 +367,7 @@ def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
                 self.wfile.write(content.encode('utf-8'))
                 return
             path = unquote(parsed.path)
-            physical_path = get_physical_path_for_virtual(path)
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
             if not physical_path or not os.path.exists(physical_path):
                 self.send_response(404)
                 self.end_headers()
@@ -483,7 +527,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 physical_path = os.path.join(self._upload_src_path, name)
                 map_virtual_path(virt, physical_path)
             else:
-                physical_path = get_physical_path_for_virtual(virt)
+                is_file, is_dir, physical_path = get_virtual_item_info(virt)
                 if not physical_path or not os.path.exists(physical_path):
                     raise asyncssh.SFTPNoSuchFile(virt)
             mode = self._mode_from_pflags(pflags)
@@ -1475,6 +1519,11 @@ def main():
         save_config_if_missing(new_config, config_path=config_path)
 
     initialize_virtual_index_from_disks(disks)
+
+    # Store globally for unified view BEFORE starting servers
+    global global_src_folders, global_disks
+    global_src_folders = src_folders
+    global_disks = disks
 
     s3_enabled = s3_server_config.get('enabled', False)
     s3_upload_src = s3_server_config.get('upload_src', src)
