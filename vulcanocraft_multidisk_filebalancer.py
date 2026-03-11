@@ -36,19 +36,49 @@ try_import_fuse()
 def install_libfuse():
     import platform
     import subprocess
+    import shutil
     system = platform.system().lower()
     print(f"Attempting to install libfuse for {system}...")
+
+    def run_cmd(cmd, shell=False):
+        subprocess.run(cmd, check=True, shell=shell)
+
     try:
         if system == "linux":
-            # Try apt (Debian/Ubuntu)
-            subprocess.run(["sudo", "apt-get", "update"], check=True)
-            subprocess.run(["sudo", "apt-get", "install", "-y", "libfuse2"], check=True)
+            if shutil.which("apt-get"):
+                run_cmd(["sudo", "apt-get", "update"])
+                run_cmd(["sudo", "apt-get", "install", "-y", "libfuse2"])
+            elif shutil.which("dnf"):
+                run_cmd(["sudo", "dnf", "install", "-y", "fuse-libs"])
+            elif shutil.which("pacman"):
+                run_cmd(["sudo", "pacman", "-S", "--noconfirm", "fuse2"])
+            else:
+                print("No supported package manager (apt, dnf, pacman) found on Linux.")
+                return False
+
         elif system == "windows":
-            # Try winget for WinFsp
-            subprocess.run(["winget", "install", "WinFsp.WinFsp"], check=True)
+            if shutil.which("winget"):
+                run_cmd(["winget", "install", "--id", "WinFsp.WinFsp", "--accept-package-agreements", "--accept-source-agreements"])
+            else:
+                print("winget not found. Attempting direct installation of WinFsp via PowerShell...")
+                # WinFsp v2.0 release
+                winfsp_url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+                ps_cmd = f"Invoke-WebRequest -Uri {winfsp_url} -OutFile winfsp.msi; Start-Process msiexec.exe -ArgumentList '/i winfsp.msi /quiet /norestart' -Wait; Remove-Item winfsp.msi"
+                run_cmd(["powershell", "-Command", ps_cmd])
+
         elif system == "darwin":
-            # Try brew for macfuse
-            subprocess.run(["brew", "install", "--cask", "macfuse"], check=True)
+            if shutil.which("brew"):
+                run_cmd(["brew", "install", "--cask", "macfuse"])
+            else:
+                print("Homebrew not found. Attempting direct installation of macFUSE...")
+                # macFUSE v4.8.3
+                macfuse_url = "https://github.com/osxfuse/osxfuse/releases/download/macfuse-4.8.3/macfuse-4.8.3.dmg"
+                run_cmd(["curl", "-L", "-o", "macfuse.dmg", macfuse_url])
+                run_cmd(["hdiutil", "attach", "macfuse.dmg"])
+                # We expect the volume name to be macFUSE
+                run_cmd(r"sudo installer -pkg /Volumes/macFUSE/Install\ macFUSE.pkg -target /", shell=True)
+                run_cmd(["hdiutil", "detach", "/Volumes/macFUSE"])
+                run_cmd(["rm", "macfuse.dmg"])
 
         # Also ensure fusepy is installed
         subprocess.run([sys.executable, "-m", "pip", "install", "fusepy"], check=True)
