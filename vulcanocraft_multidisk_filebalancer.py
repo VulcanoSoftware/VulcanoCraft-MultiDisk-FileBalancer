@@ -222,22 +222,33 @@ def list_virtual_dir(virtual_dir):
 def initialize_virtual_index(folders):
     """Recursively populates the virtual index from a list of physical folders."""
     changed = False
+    with virtual_index_lock:
+        # Prune entries that no longer exist physically
+        to_remove = []
+        for virt, phys in virtual_index['files'].items():
+            if not os.path.exists(phys):
+                to_remove.append(virt)
+        for virt in to_remove:
+            del virtual_index['files'][virt]
+            changed = True
+
     for folder_path in folders:
         if not folder_path or not os.path.isdir(folder_path):
             continue
 
         for root, dirs, files in os.walk(folder_path):
             for name in files:
-                physical_path = os.path.join(root, name)
+                physical_path = os.path.abspath(os.path.join(root, name))
 
                 # Determine virtual path relative to the disk/source root
-                rel_path = os.path.relpath(physical_path, folder_path)
+                rel_path = os.path.relpath(physical_path, os.path.abspath(folder_path))
                 virtual_path = '/' + rel_path.replace(os.sep, '/')
                 virtual_path = normalize_virtual_path(virtual_path)
 
                 with virtual_index_lock:
                     # Avoid duplicates: check if physical path already indexed
-                    if physical_path in virtual_index['files'].values():
+                    indexed_physicals = [os.path.abspath(p) for p in virtual_index['files'].values()]
+                    if physical_path in indexed_physicals:
                         continue
                     # Avoid virtual collisions: first one wins
                     if virtual_path in virtual_index['files']:
@@ -365,6 +376,10 @@ def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
 def start_s3_server_thread(s3_config, upload_src_path, webhook_url):
     if not s3_config.get('enabled', False):
         return
+
+    print(f"DEBUG: S3 thread starting for {s3_config.get('host', '0.0.0.0')}:{s3_config.get('port', 9000)}")
+    sys.stdout.flush()
+
     host = s3_config.get('host', '0.0.0.0')
     port = int(s3_config.get('port', 9000))
     access_key = s3_config.get('access_key') or None
@@ -373,6 +388,8 @@ def start_s3_server_thread(s3_config, upload_src_path, webhook_url):
 
     def run_server():
         try:
+            print(f"DEBUG: Binding S3 server to {host}:{port}")
+            sys.stdout.flush()
             server = HTTPServer((host, port), handler_cls)
             print_and_discord(f"S3 server started on {host}:{port}", webhook_url)
             server.serve_forever()
@@ -385,6 +402,9 @@ def start_s3_server_thread(s3_config, upload_src_path, webhook_url):
 def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     if not sftp_config.get('enabled', False):
         return
+
+    print(f"DEBUG: SFTP thread starting for {sftp_config.get('host', '0.0.0.0')}:{sftp_config.get('port', 2222)}")
+    sys.stdout.flush()
 
     host = sftp_config.get('host', '0.0.0.0')
     port = int(sftp_config.get('port', 2222))
@@ -573,6 +593,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             physical_path = self._safe_join(self._upload_src_path, virt)
             try:
                 os.makedirs(physical_path, exist_ok=True)
+                # Virtual directories are implicitly shown via list_virtual_dir,
+                # but we can force an index update if needed.
+                # For now, it will be picked up in the next scan cycle.
             except Exception as e:
                 raise asyncssh.SFTPFailure(str(e))
 
@@ -594,19 +617,30 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     async def start_server():
         server_host_keys = []
         if host_key_path and os.path.exists(host_key_path):
+            print(f"DEBUG: Loading SFTP host key from {host_key_path}")
+            sys.stdout.flush()
             server_host_keys = [host_key_path]
         else:
             # Generate multiple types of keys for better compatibility
+            print("DEBUG: Generating ephemeral SFTP host keys (Ed25519, RSA)...")
+            sys.stdout.flush()
             for alg in ['ssh-ed25519', 'ssh-rsa']:
                 try:
+                    print(f"DEBUG: Generating {alg} key...")
+                    sys.stdout.flush()
                     server_host_keys.append(asyncssh.generate_private_key(alg))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"DEBUG: Failed to generate {alg} key: {e}")
+                    sys.stdout.flush()
 
         if not server_host_keys:
+            print("DEBUG: No SFTP host keys available, server might fail to start.")
+            sys.stdout.flush()
             server_host_keys = None
 
         try:
+            print(f"DEBUG: Binding SFTP server to {host}:{port}")
+            sys.stdout.flush()
             await asyncssh.listen(
                 host,
                 port,
@@ -614,19 +648,23 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 server_host_keys=server_host_keys,
                 sftp_factory=SimpleSFTPServer,
             )
+            print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
         except Exception as e:
             print_and_discord(f"SFTP: Failed to listen on {host}:{port}: {e}", webhook_url)
             raise
 
     def run_server():
         try:
+            print("DEBUG: SFTP loop starting...")
+            sys.stdout.flush()
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(start_server())
-            print_and_discord(f"SFTP server started on {host}:{port}", webhook_url)
+            print_and_discord(f"SFTP server task completed setup on {host}:{port}", webhook_url)
             loop.run_forever()
         except Exception as e:
             print_and_discord(f"Could not start SFTP server: {e}", webhook_url)
+            sys.stdout.flush()
 
     threading.Thread(target=run_server, daemon=True).start()
 
@@ -712,13 +750,29 @@ def create_virtual_fuse_class():
                 raise FuseOSError(errno.ENOENT)
 
         def rmdir(self, path):
-            # We don't really support virtual directories that are not backed by physical ones
-            # or empty virtual directories.
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
+            if not is_dir:
+                raise FuseOSError(errno.ENOTDIR)
+
+            # If it's a physical directory in upload_src, we can try to delete it
+            target = self._safe_join(self.upload_src_path, path)
+            if os.path.isdir(target):
+                try:
+                    os.rmdir(target)
+                    return
+                except OSError as e:
+                    raise FuseOSError(e.errno)
+
+            # If it's a virtual directory (merging multiple disks), we can't easily rmdir
             raise FuseOSError(errno.EPERM)
 
         def mkdir(self, path, mode):
-            # Everything is flat in the current implementation
-            raise FuseOSError(errno.EPERM)
+            try:
+                physical_path = self._safe_join(self.upload_src_path, path)
+                os.makedirs(physical_path, exist_ok=True)
+            except Exception as e:
+                print(f"FUSE mkdir error: {e}")
+                raise FuseOSError(errno.EPERM)
     return VirtualFUSE
 
 
@@ -1114,29 +1168,36 @@ def ask_disk_info(disk_number):
 
 def check_files_and_move(src, disks, last_disk, webhook_url, min_file_age_hours, extra_safety_space_gb):
     new_last_disk = last_disk
-    files = [f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f))]
 
     time_limit = timedelta(hours=min_file_age_hours)
     now = datetime.now()
     files_to_move = []
 
-    for file in files:
-        source_path = os.path.join(src, file)
-        modified_date = get_last_modified_time(source_path)
+    # Use os.walk for recursive scan
+    for root, dirs, files in os.walk(src):
+        for name in files:
+            source_path = os.path.join(root, name)
+            modified_date = get_last_modified_time(source_path)
 
-        if now - modified_date > time_limit:
-            files_to_move.append(file)
-        else:
-            print_and_discord(f"{file} was modified too recently and will not be moved.", webhook_url)
+            if now - modified_date > time_limit:
+                # Store relative path to preserve structure
+                rel_path = os.path.relpath(source_path, src)
+                files_to_move.append((source_path, rel_path))
+            else:
+                print_and_discord(f"{name} was modified too recently and will not be moved.", webhook_url)
+
+    if not files_to_move:
+        return new_last_disk
 
     print_and_discord("\nStarting to move files:", webhook_url)
-    for file in files_to_move:
-        source_path = os.path.join(src, file)
+    for source_path, rel_path in files_to_move:
+        if not os.path.exists(source_path):
+            continue
+
         file_size_gb = get_file_size(source_path) // (2**30)
         required_space = file_size_gb + extra_safety_space_gb
 
         file_moved = False
-        original_disk = new_last_disk
         target_disk = get_next_disk(new_last_disk, [disk['name'] for disk in disks])
 
         for _ in range(len(disks)):
@@ -1144,25 +1205,32 @@ def check_files_and_move(src, disks, last_disk, webhook_url, min_file_age_hours,
             target_path = target_info['path']
 
             print_and_discord(
-                f"File: {file}, Size: {file_size_gb} GB, Required space: {required_space} GB",
+                f"File: {rel_path}, Size: {file_size_gb} GB, Required space: {required_space} GB",
                 webhook_url,
             )
             print_and_discord(f"Attempting to move to {target_disk}", webhook_url)
 
             if has_sufficient_free_space(target_path, required_space):
-                destination_path = os.path.join(target_path, file)
-                shutil.move(source_path, destination_path)
-                update_virtual_index_after_move(source_path, destination_path)
-                print_and_discord(f"{file} moved to {target_disk}", webhook_url)
-                new_last_disk = target_disk
-                file_moved = True
-                break
+                destination_path = os.path.join(target_path, rel_path)
+                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+
+                try:
+                    shutil.move(source_path, destination_path)
+                    update_virtual_index_after_move(source_path, destination_path)
+                    print_and_discord(f"{rel_path} moved to {target_disk}", webhook_url)
+                    new_last_disk = target_disk
+                    file_moved = True
+                    break
+                except Exception as e:
+                    print_and_discord(f"Error moving {rel_path} to {target_disk}: {e}", webhook_url)
+                    # Try next disk
+                    target_disk = get_next_disk(target_disk, [disk['name'] for disk in disks])
             else:
-                print_and_discord(f"Not enough space for {file} on {target_disk}", webhook_url)
+                print_and_discord(f"Not enough space for {rel_path} on {target_disk}", webhook_url)
                 target_disk = get_next_disk(target_disk, [disk['name'] for disk in disks])
 
         if not file_moved:
-            print_and_discord(f"No disk has enough space for {file}, skipping file.", webhook_url)
+            print_and_discord(f"No disk has enough space for {rel_path}, skipping file.", webhook_url)
 
     print_and_discord("\nFile moving completed!", webhook_url)
     return new_last_disk
@@ -1382,7 +1450,7 @@ def main():
     if not last_disk and disks:
         last_disk = disks[0]['name']
 
-    if not space_hunter_disks:
+    if not space_hunter_disks and not config_exists:
         use_space_hunter = input("Do you want to enable automatic disk space checks and cleanup? (yes/no): ").lower() == 'yes'
         if use_space_hunter:
             min_space_input = input(f"Default minimum free space in GB for space hunter (default {space_check_default_min_free_gb}): ").strip()
@@ -1412,7 +1480,7 @@ def main():
             except ValueError:
                 print("Enter a valid number for the number of disks.")
 
-    if not os.path.exists(config_path):
+    if not config_exists:
         print("\nAdvanced settings for file distribution:")
         min_age_input = input(f"Minimum file age in hours (default {min_file_age_hours}): ").strip()
         if min_age_input.isdigit():
@@ -1670,6 +1738,14 @@ def main():
             last_reverse_run = datetime.now()
             reverse_interval = timedelta(minutes=reverse_interval_minutes)
             while True:
+                # Refresh virtual index at the start of every cycle
+                all_folders = list(src_folders)
+                for d in disks:
+                    dp = d.get('path')
+                    if dp and dp not in all_folders:
+                        all_folders.append(dp)
+                initialize_virtual_index(all_folders)
+
                 print_and_discord("======================================================", webhook_url)
                 for source_folder in valid_src_folders:
                     print_and_discord(f"Checking source folder: {source_folder}", webhook_url)

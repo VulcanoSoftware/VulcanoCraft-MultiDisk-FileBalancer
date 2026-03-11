@@ -1,0 +1,27 @@
+src: "./input"
+src_folders: ["./input"]
+disks:
+  - name: disk1
+    path: "./disk1"
+last_disk: "disk1"
+space_hunter_disks: []
+webhook_url: ""
+settings:
+  scan_interval_seconds: 5
+  min_file_age_hours: 0
+  extra_safety_space_gb: 0
+  console_clear_interval_hours: 1
+  space_check_default_min_free_gb: 1
+s3_server:
+  enabled: false
+sftp_server:
+  enabled: true
+  host: "127.0.0.1"
+  port: 2222
+  username: "testuser"
+  password: "password"
+  upload_src: "./input"
+fuse_server:
+  enabled: false
+reverse_raid:
+  enabled: false
