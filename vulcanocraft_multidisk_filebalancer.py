@@ -90,25 +90,20 @@ def install_libfuse():
 
 current_dir = os.getcwd()
 config_path = os.path.join(current_dir, "config.yml")
-virtual_index_path = os.path.join(current_dir, "virtual_index.yml")
-virtual_index_lock = threading.Lock()
+
+_vfs_base_paths = []
+_vfs_base_paths_lock = threading.Lock()
 
 
-def load_virtual_index():
-    if os.path.exists(virtual_index_path):
-        with open(virtual_index_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f) or {}
-            files = data.get('files', {}) or {}
-            return {'files': files}
-    return {'files': {}}
+def set_vfs_base_paths(paths):
+    with _vfs_base_paths_lock:
+        _vfs_base_paths.clear()
+        _vfs_base_paths.extend(p for p in paths if p)
 
 
-virtual_index = load_virtual_index()
-
-
-def write_virtual_index():
-    with open(virtual_index_path, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(virtual_index, f, allow_unicode=True)
+def get_vfs_base_paths():
+    with _vfs_base_paths_lock:
+        return list(_vfs_base_paths)
 
 
 def normalize_virtual_path(virtual_path):
@@ -120,129 +115,45 @@ def normalize_virtual_path(virtual_path):
     return path
 
 
-def map_virtual_path(virtual_path, physical_path):
-    virtual = normalize_virtual_path(virtual_path)
-    with virtual_index_lock:
-        virtual_index['files'][virtual] = physical_path
-        write_virtual_index()
-
-
-def get_physical_path_for_virtual(virtual_path):
-    virtual = normalize_virtual_path(virtual_path)
-    with virtual_index_lock:
-        return virtual_index['files'].get(virtual)
-
-
-def remove_virtual_file(virtual_path):
-    virtual = normalize_virtual_path(virtual_path)
-    with virtual_index_lock:
-        physical = virtual_index['files'].pop(virtual, None)
-        if physical:
-            write_virtual_index()
-        return physical
-
-
-def remove_virtual_file_by_physical_path(physical_path):
-    changed_keys = []
-    with virtual_index_lock:
-        for virtual, physical in list(virtual_index['files'].items()):
-            if physical == physical_path:
-                changed_keys.append(virtual)
-        for key in changed_keys:
-            virtual_index['files'].pop(key, None)
-        if changed_keys:
-            write_virtual_index()
-
-
-def update_virtual_index_after_move(old_path, new_path):
-    with virtual_index_lock:
-        changed = False
-        for virtual, physical in list(virtual_index['files'].items()):
-            if physical == old_path:
-                virtual_index['files'][virtual] = new_path
-                changed = True
-        if changed:
-            write_virtual_index()
-
-
 def get_virtual_item_info(virtual_path):
     """Returns (is_file, is_dir, physical_path) for a virtual path."""
     virt = normalize_virtual_path(virtual_path)
-    with virtual_index_lock:
-        physical_path = virtual_index['files'].get(virt)
-        if physical_path:
-            return True, os.path.isdir(physical_path), physical_path
-
-        # Check if it's a virtual directory
-        prefix = virt.rstrip('/') + '/'
-        is_dir = False
-        for k in virtual_index['files'].keys():
-            if k.startswith(prefix):
-                is_dir = True
-                break
-        if is_dir or virt == '/':
-            return False, True, None
-
+    if virt == '/':
+        return False, True, None
+    rel = virt.lstrip('/')
+    for base in get_vfs_base_paths():
+        candidate = os.path.join(base, rel)
+        if os.path.isfile(candidate):
+            return True, False, candidate
+        if os.path.isdir(candidate):
+            return False, True, candidate
     return False, False, None
 
 
 def list_virtual_dir(virtual_dir):
     """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
     virt_dir = normalize_virtual_path(virtual_dir)
-    with virtual_index_lock:
-        keys = list(virtual_index['files'].keys())
-
-    if virt_dir == '/':
-        prefix = '/'
-        relevant = keys
-    else:
-        prefix = virt_dir.rstrip('/') + '/'
-        relevant = [k for k in keys if k.startswith(prefix)]
-
-    children = {}
-    for k in relevant:
-        if virt_dir == '/':
-            rest = k.lstrip('/')
-        else:
-            rest = k[len(prefix):]
-
-        if not rest:
-            continue
-
-        parts = rest.split('/', 1)
-        name = parts[0]
-        if not name:
-            continue
-
-        full_virtual = virt_dir.rstrip('/') + '/' + name
-        children[name] = full_virtual
-    return children
-
-
-def initialize_virtual_index_from_disks(disks):
-    changed = False
-    for disk in disks:
-        path = disk.get('path')
-        if not path or not os.path.isdir(path):
+    rel = virt_dir.lstrip('/')
+    seen = {}
+    for base in get_vfs_base_paths():
+        scan_path = os.path.join(base, rel) if rel else base
+        if not os.path.isdir(scan_path):
             continue
         try:
-            names = os.listdir(path)
-        except Exception:
+            for name in os.listdir(scan_path):
+                if name not in seen:
+                    full_virtual = virt_dir.rstrip('/') + '/' + name
+                    seen[name] = full_virtual
+        except OSError:
             continue
-        for name in names:
-            physical_path = os.path.join(path, name)
-            if not os.path.isfile(physical_path):
-                continue
-            with virtual_index_lock:
-                if physical_path in virtual_index['files'].values():
-                    continue
-                virtual_path = '/' + name
-                if virtual_path in virtual_index['files']:
-                    continue
-                virtual_index['files'][virtual_path] = physical_path
-                changed = True
-    if changed:
-        write_virtual_index()
+    return seen
+
+
+def get_physical_path_for_virtual(virtual_path):
+    is_file, _is_dir, physical_path = get_virtual_item_info(virtual_path)
+    if is_file:
+        return physical_path
+    return None
 
 
 def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
@@ -291,8 +202,6 @@ def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
                             break
                         f.write(chunk)
                         resterend -= len(chunk)
-                virt_path = normalize_virtual_path(unquote(parsed.path))
-                map_virtual_path(virt_path, physical_path)
             except Exception:
                 met_error = True
             if met_error:
@@ -309,14 +218,9 @@ def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
             query = parse_qs(parsed.query or '')
             if 'list' in query:
                 prefix = normalize_virtual_path(unquote(parsed.path))
-                with virtual_index_lock:
-                    keys = list(virtual_index['files'].keys())
-                if prefix != '/':
-                    normalized_prefix = prefix.rstrip('/') + '/'
-                    filtered = [k for k in keys if k.startswith(normalized_prefix)]
-                else:
-                    filtered = keys
-                content = "\n".join(sorted(filtered))
+                children = list_virtual_dir(prefix)
+                all_keys = sorted('/' + name for name in children)
+                content = "\n".join(all_keys)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
@@ -340,7 +244,7 @@ def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
                 return
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
-            physical_path = remove_virtual_file(path)
+            physical_path = get_physical_path_for_virtual(path)
             if physical_path and os.path.exists(physical_path):
                 try:
                     os.remove(physical_path)
@@ -412,6 +316,10 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 return '/'
             return normalize_virtual_path(path_str)
 
+        def _upload_physical_path(self, virt):
+            rel = virt.lstrip('/')
+            return os.path.join(self._upload_src_path, rel) if rel else self._upload_src_path
+
         def canonicalize(self, path):
             virt = self._normalize_virtual(path)
             return virt.encode('utf-8')
@@ -477,11 +385,11 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             virt = self._normalize_virtual(path)
             write = bool(pflags & FXF_WRITE)
             if write:
-                name = virt.strip('/').split('/')[-1]
-                if not name:
+                rel = virt.lstrip('/')
+                if not rel:
                     raise asyncssh.SFTPFailure('Invalid file name')
-                physical_path = os.path.join(self._upload_src_path, name)
-                map_virtual_path(virt, physical_path)
+                physical_path = os.path.join(self._upload_src_path, rel)
+                os.makedirs(os.path.dirname(physical_path), exist_ok=True)
             else:
                 physical_path = get_physical_path_for_virtual(virt)
                 if not physical_path or not os.path.exists(physical_path):
@@ -492,11 +400,49 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
         async def remove(self, path):
             virt = self._normalize_virtual(path)
-            physical_path = remove_virtual_file(virt)
+            physical_path = get_physical_path_for_virtual(virt)
             if physical_path and os.path.exists(physical_path):
                 os.remove(physical_path)
                 return
             raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def mkdir(self, path, attrs):
+            virt = self._normalize_virtual(path)
+            physical_path = self._upload_physical_path(virt)
+            os.makedirs(physical_path, exist_ok=True)
+
+        async def rmdir(self, path):
+            virt = self._normalize_virtual(path)
+            is_file, is_dir, physical_path = get_virtual_item_info(virt)
+            if not is_dir:
+                raise asyncssh.SFTPNoSuchFile(virt)
+            if physical_path and os.path.isdir(physical_path):
+                try:
+                    os.rmdir(physical_path)
+                except OSError as exc:
+                    raise asyncssh.SFTPFailure(str(exc)) from exc
+                return
+            rel = virt.lstrip('/')
+            for base in get_vfs_base_paths():
+                candidate = os.path.join(base, rel)
+                if os.path.isdir(candidate):
+                    try:
+                        os.rmdir(candidate)
+                    except OSError as exc:
+                        raise asyncssh.SFTPFailure(str(exc)) from exc
+                    return
+            raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def rename(self, oldpath, newpath, flags=0):
+            old_virt = self._normalize_virtual(oldpath)
+            new_virt = self._normalize_virtual(newpath)
+            is_file, is_dir, old_physical = get_virtual_item_info(old_virt)
+            if not old_physical or not os.path.exists(old_physical):
+                raise asyncssh.SFTPNoSuchFile(old_virt)
+            new_rel = new_virt.lstrip('/')
+            new_physical = os.path.join(self._upload_src_path, new_rel)
+            os.makedirs(os.path.dirname(new_physical), exist_ok=True)
+            os.rename(old_physical, new_physical)
 
     async def start_server():
         server_host_keys = None
@@ -535,6 +481,10 @@ def create_virtual_fuse_class():
             self.upload_src_path = upload_src_path
             os.makedirs(self.upload_src_path, exist_ok=True)
 
+        def _upload_physical_path(self, path):
+            rel = path.lstrip('/')
+            return os.path.join(self.upload_src_path, rel) if rel else self.upload_src_path
+
         def getattr(self, path, fh=None):
             is_file, is_dir, physical_path = get_virtual_item_info(path)
             if physical_path and os.path.exists(physical_path):
@@ -566,13 +516,12 @@ def create_virtual_fuse_class():
             return os.open(physical_path, flags)
 
         def create(self, path, mode, fi=None):
-            name = path.strip('/').split('/')[-1]
-            if not name:
+            rel = path.lstrip('/')
+            if not rel:
                 raise FuseOSError(errno.EINVAL)
-            physical_path = os.path.join(self.upload_src_path, name)
-            fd = os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-            map_virtual_path(path, physical_path)
-            return fd
+            physical_path = os.path.join(self.upload_src_path, rel)
+            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
+            return os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
 
         def read(self, path, length, offset, fh):
             os.lseek(fh, offset, os.SEEK_SET)
@@ -595,20 +544,45 @@ def create_virtual_fuse_class():
             return os.close(fh)
 
         def unlink(self, path):
-            physical_path = remove_virtual_file(path)
+            physical_path = get_physical_path_for_virtual(path)
             if physical_path and os.path.exists(physical_path):
                 os.remove(physical_path)
             else:
                 raise FuseOSError(errno.ENOENT)
 
-        def rmdir(self, path):
-            # We don't really support virtual directories that are not backed by physical ones
-            # or empty virtual directories.
-            raise FuseOSError(errno.EPERM)
-
         def mkdir(self, path, mode):
-            # Everything is flat in the current implementation
-            raise FuseOSError(errno.EPERM)
+            physical_path = self._upload_physical_path(path)
+            os.makedirs(physical_path, exist_ok=True)
+
+        def rmdir(self, path):
+            is_file, is_dir, physical_path = get_virtual_item_info(path)
+            if not is_dir:
+                raise FuseOSError(errno.ENOENT)
+            if physical_path and os.path.isdir(physical_path):
+                try:
+                    os.rmdir(physical_path)
+                    return
+                except OSError as exc:
+                    raise FuseOSError(exc.errno) from exc
+            rel = path.lstrip('/')
+            for base in get_vfs_base_paths():
+                candidate = os.path.join(base, rel)
+                if os.path.isdir(candidate):
+                    try:
+                        os.rmdir(candidate)
+                        return
+                    except OSError as exc:
+                        raise FuseOSError(exc.errno) from exc
+            raise FuseOSError(errno.ENOENT)
+
+        def rename(self, old, new):
+            is_file, is_dir, old_physical = get_virtual_item_info(old)
+            if not old_physical or not os.path.exists(old_physical):
+                raise FuseOSError(errno.ENOENT)
+            new_physical = self._upload_physical_path(new)
+            os.makedirs(os.path.dirname(new_physical), exist_ok=True)
+            os.rename(old_physical, new_physical)
+
     return VirtualFUSE
 
 
@@ -1004,29 +978,27 @@ def ask_disk_info(disk_number):
 
 def check_files_and_move(src, disks, last_disk, webhook_url, min_file_age_hours, extra_safety_space_gb):
     new_last_disk = last_disk
-    files = [f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f))]
-
     time_limit = timedelta(hours=min_file_age_hours)
     now = datetime.now()
+
     files_to_move = []
-
-    for file in files:
-        source_path = os.path.join(src, file)
-        modified_date = get_last_modified_time(source_path)
-
-        if now - modified_date > time_limit:
-            files_to_move.append(file)
-        else:
-            print_and_discord(f"{file} was modified too recently and will not be moved.", webhook_url)
+    for dirpath, _dirnames, filenames in os.walk(src):
+        for filename in filenames:
+            source_path = os.path.join(dirpath, filename)
+            modified_date = get_last_modified_time(source_path)
+            if now - modified_date > time_limit:
+                rel_path = os.path.relpath(source_path, src)
+                files_to_move.append(rel_path)
+            else:
+                print_and_discord(f"{filename} was modified too recently and will not be moved.", webhook_url)
 
     print_and_discord("\nStarting to move files:", webhook_url)
-    for file in files_to_move:
-        source_path = os.path.join(src, file)
+    for rel_path in files_to_move:
+        source_path = os.path.join(src, rel_path)
         file_size_gb = get_file_size(source_path) // (2**30)
         required_space = file_size_gb + extra_safety_space_gb
 
         file_moved = False
-        original_disk = new_last_disk
         target_disk = get_next_disk(new_last_disk, [disk['name'] for disk in disks])
 
         for _ in range(len(disks)):
@@ -1034,25 +1006,25 @@ def check_files_and_move(src, disks, last_disk, webhook_url, min_file_age_hours,
             target_path = target_info['path']
 
             print_and_discord(
-                f"File: {file}, Size: {file_size_gb} GB, Required space: {required_space} GB",
+                f"File: {rel_path}, Size: {file_size_gb} GB, Required space: {required_space} GB",
                 webhook_url,
             )
             print_and_discord(f"Attempting to move to {target_disk}", webhook_url)
 
             if has_sufficient_free_space(target_path, required_space):
-                destination_path = os.path.join(target_path, file)
+                destination_path = os.path.join(target_path, rel_path)
+                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
                 shutil.move(source_path, destination_path)
-                update_virtual_index_after_move(source_path, destination_path)
-                print_and_discord(f"{file} moved to {target_disk}", webhook_url)
+                print_and_discord(f"{rel_path} moved to {target_disk}", webhook_url)
                 new_last_disk = target_disk
                 file_moved = True
                 break
             else:
-                print_and_discord(f"Not enough space for {file} on {target_disk}", webhook_url)
+                print_and_discord(f"Not enough space for {rel_path} on {target_disk}", webhook_url)
                 target_disk = get_next_disk(target_disk, [disk['name'] for disk in disks])
 
         if not file_moved:
-            print_and_discord(f"No disk has enough space for {file}, skipping file.", webhook_url)
+            print_and_discord(f"No disk has enough space for {rel_path}, skipping file.", webhook_url)
 
     print_and_discord("\nFile moving completed!", webhook_url)
     return new_last_disk
@@ -1074,11 +1046,9 @@ def remove_oldest_file(folder_path, webhook_url, action, move_destination=None):
             if action == 'move' and move_destination:
                 new_path = os.path.join(move_destination, os.path.basename(oldest_file))
                 shutil.move(oldest_file, new_path)
-                update_virtual_index_after_move(oldest_file, new_path)
                 print_and_discord(f"The oldest file was moved: {oldest_file} to {new_path}", webhook_url)
             elif action == 'delete':
                 os.remove(oldest_file)
-                remove_virtual_file_by_physical_path(oldest_file)
                 print_and_discord(f"The oldest file was deleted: {oldest_file}", webhook_url)
             else:
                 print_and_discord(f"Invalid action or missing move destination: {action}", webhook_url)
@@ -1148,44 +1118,44 @@ def reverse_move_files(reverse_config, webhook_url):
         files_in_folder = 0
         moved_in_folder = 0
 
-        files = [f for f in os.listdir(source_folder) if os.path.isfile(os.path.join(source_folder, f))]
+        for dirpath, _dirnames, filenames in os.walk(source_folder):
+            for filename in filenames:
+                source_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(source_path, source_folder)
+                destination_file_path = os.path.join(destination_path, rel_path)
 
-        for filename in files:
-            source_path = os.path.join(source_folder, filename)
-            destination_file_path = os.path.join(destination_path, filename)
+                file_time = os.path.getmtime(source_path)
+                file_age_hours = (time.time() - file_time) / 3600
 
-            file_time = os.path.getmtime(source_path)
-            file_age_hours = (time.time() - file_time) / 3600
+                if file_age_hours < min_age_hours:
+                    print_and_discord(
+                        f"Reverse RAID: skipping {rel_path}, too new ({file_age_hours:.1f} hours).",
+                        webhook_url,
+                    )
+                    total_skipped_too_new += 1
+                    continue
 
-            if file_age_hours < min_age_hours:
-                print_and_discord(
-                    f"Reverse RAID: skipping {filename}, too new ({file_age_hours:.1f} hours).",
-                    webhook_url,
-                )
-                total_skipped_too_new += 1
-                continue
+                total_files += 1
+                files_in_folder += 1
 
-            total_files += 1
-            files_in_folder += 1
+                if os.path.exists(destination_file_path):
+                    print_and_discord(
+                        f"Reverse RAID: skipping {rel_path}, already exists in destination folder.",
+                        webhook_url,
+                    )
+                    continue
 
-            if os.path.exists(destination_file_path):
-                print_and_discord(
-                    f"Reverse RAID: skipping {filename}, already exists in destination folder.",
-                    webhook_url,
-                )
-                continue
-
-            try:
-                shutil.move(source_path, destination_file_path)
-                update_virtual_index_after_move(source_path, destination_file_path)
-                print_and_discord(f"Reverse RAID: moved {filename}", webhook_url)
-                total_moved += 1
-                moved_in_folder += 1
-            except Exception as e:
-                print_and_discord(
-                    f"Reverse RAID: error while moving {filename}: {e}",
-                    webhook_url,
-                )
+                try:
+                    os.makedirs(os.path.dirname(destination_file_path), exist_ok=True)
+                    shutil.move(source_path, destination_file_path)
+                    print_and_discord(f"Reverse RAID: moved {rel_path}", webhook_url)
+                    total_moved += 1
+                    moved_in_folder += 1
+                except Exception as e:
+                    print_and_discord(
+                        f"Reverse RAID: error while moving {rel_path}: {e}",
+                        webhook_url,
+                    )
 
         if files_in_folder > 0:
             print_and_discord(
@@ -1474,7 +1444,23 @@ def main():
             new_config['reverse_raid'] = reverse_raid_config
         save_config_if_missing(new_config, config_path=config_path)
 
-    initialize_virtual_index_from_disks(disks)
+    # Normalize disks: ensure every disk has both Dutch ('naam', 'pad') and English ('name', 'path') keys.
+    for disk in disks:
+        if 'name' not in disk and 'naam' in disk:
+            disk['name'] = disk['naam']
+        if 'naam' not in disk and 'name' in disk:
+            disk['naam'] = disk['name']
+        if 'path' not in disk and 'pad' in disk:
+            disk['path'] = disk['pad']
+        if 'pad' not in disk and 'path' in disk:
+            disk['pad'] = disk['path']
+
+    # Normalize space_hunter_disks: it uses 'path'/'pad' too.
+    for disk in space_hunter_disks:
+        if 'path' not in disk and 'pad' in disk:
+            disk['path'] = disk['pad']
+        if 'pad' not in disk and 'path' in disk:
+            disk['pad'] = disk['path']
 
     s3_enabled = s3_server_config.get('enabled', False)
     s3_upload_src = s3_server_config.get('upload_src', src)
@@ -1501,23 +1487,8 @@ def main():
         src_folders.append(fuse_upload_src)
     start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
-    # Normalize disks: ensure every disk has both Dutch ('naam', 'pad') and English ('name', 'path') keys.
-    for disk in disks:
-        if 'name' not in disk and 'naam' in disk:
-            disk['name'] = disk['naam']
-        if 'naam' not in disk and 'name' in disk:
-            disk['naam'] = disk['name']
-        if 'path' not in disk and 'pad' in disk:
-            disk['path'] = disk['pad']
-        if 'pad' not in disk and 'path' in disk:
-            disk['pad'] = disk['path']
-
-    # Normalize space_hunter_disks: it uses 'path'/'pad' too.
-    for disk in space_hunter_disks:
-        if 'path' not in disk and 'pad' in disk:
-            disk['path'] = disk['pad']
-        if 'pad' not in disk and 'path' in disk:
-            disk['pad'] = disk['path']
+    all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
+    set_vfs_base_paths(all_vfs_paths)
 
     while True:
         try:
