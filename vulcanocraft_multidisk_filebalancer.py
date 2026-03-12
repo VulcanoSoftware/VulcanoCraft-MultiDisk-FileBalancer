@@ -313,7 +313,6 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         def __init__(self, chan):
             self._upload_src_path = upload_src_path
             os.makedirs(self._upload_src_path, exist_ok=True)
-            self._dir_handles = {}
             super().__init__(chan)
 
         def _normalize_virtual(self, path):
@@ -337,10 +336,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             virt = self._normalize_virtual(path)
             return virt.encode('utf-8')
 
-        def opendir(self, path):
+        async def scandir(self, path):
             virt_dir = self._normalize_virtual(path)
             names = list_virtual_dir(virt_dir)
-            entries = []
             for name, full_virtual in sorted(names.items()):
                 is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
                 if physical_path and os.path.exists(physical_path):
@@ -355,24 +353,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                         mtime=now,
                         size=0
                     )
-                entries.append(SFTPName(name.encode('utf-8'), None, attrs))
-
-            handle = os.urandom(8)
-            self._dir_handles[handle] = entries
-            return handle
-
-        def readdir(self, handle):
-            if handle not in self._dir_handles:
-                raise asyncssh.SFTPBadMessage('Invalid directory handle')
-
-            entries = self._dir_handles[handle]
-            if not entries:
-                return None
-
-            return entries.pop(0)
-
-        def closedir(self, handle):
-            self._dir_handles.pop(handle, None)
+                yield SFTPName(name.encode('utf-8'), None, attrs)
 
         async def _stat_helper(self, path, follow_symlinks=True):
             virt = self._normalize_virtual(path)
@@ -478,37 +459,40 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             os.rename(old_physical, new_physical)
 
     async def start_server():
-        print_and_discord(f"Starting SFTP server on {host}:{port}...", webhook_url)
-        server_host_keys = []
-        if host_key_path and os.path.exists(host_key_path):
-            server_host_keys = [host_key_path]
-        else:
-            try:
-                ed25519_key = asyncssh.generate_private_key('ssh-ed25519')
-                server_host_keys.append(ed25519_key)
-            except Exception:
-                pass
-            try:
-                rsa_key = asyncssh.generate_private_key('ssh-rsa')
-                server_host_keys.append(rsa_key)
-            except Exception:
-                pass
+        try:
+            print_and_discord(f"Starting SFTP server on {host}:{port}...", webhook_url)
+            server_host_keys = []
+            if host_key_path and os.path.exists(host_key_path):
+                server_host_keys = [host_key_path]
+            else:
+                try:
+                    ed25519_key = asyncssh.generate_private_key('ssh-ed25519')
+                    server_host_keys.append(ed25519_key)
+                except Exception as e:
+                    print_and_discord(f"Warning: could not generate Ed25519 key: {e}", webhook_url)
+                try:
+                    rsa_key = asyncssh.generate_private_key('ssh-rsa')
+                    server_host_keys.append(rsa_key)
+                except Exception as e:
+                    print_and_discord(f"Warning: could not generate RSA key: {e}", webhook_url)
 
-        if not server_host_keys:
-            server_host_keys = None
+            if not server_host_keys:
+                server_host_keys = None
 
-        server = await asyncssh.listen(
-            host,
-            port,
-            server_factory=SimpleSSHServer,
-            server_host_keys=server_host_keys,
-            sftp_factory=SimpleSFTPServer,
-        )
+            server = await asyncssh.listen(
+                host,
+                port,
+                server_factory=SimpleSSHServer,
+                server_host_keys=server_host_keys,
+                sftp_factory=SimpleSFTPServer,
+            )
 
-        print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
-        if host == '127.0.0.1':
-            print_and_discord("Warning: SFTP server is bound to 127.0.0.1. External connections (including via VirtualBox port forwarding) may not work. Consider using 0.0.0.0.", webhook_url)
-        await server.wait_closed()
+            print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
+            if host == '127.0.0.1':
+                print_and_discord("Warning: SFTP server is bound to 127.0.0.1. External connections (including via VirtualBox port forwarding) may not work. Consider using 0.0.0.0.", webhook_url)
+            await server.wait_closed()
+        except Exception as e:
+            print_and_discord(f"SFTP server error during startup or execution: {e}", webhook_url)
 
     def run_server():
         try:
