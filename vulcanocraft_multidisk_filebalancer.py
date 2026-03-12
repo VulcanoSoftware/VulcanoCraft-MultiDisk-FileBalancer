@@ -91,37 +91,82 @@ def install_libfuse():
 current_dir = os.getcwd()
 config_path = os.path.join(current_dir, "config.yml")
 
-_vfs_base_paths = []
-_vfs_base_paths_lock = threading.Lock()
+_vfs_lock = threading.RLock()
+_vfs_src_folders = []
+_vfs_disks = []
+_vfs_upload_src = None
 
 
-def set_vfs_base_paths(paths):
-    with _vfs_base_paths_lock:
-        _vfs_base_paths.clear()
-        _vfs_base_paths.extend(p for p in paths if p)
+def set_vfs_config(src_folders, disks, upload_src):
+    """Set the VFS configuration for dynamic path resolution."""
+    global _vfs_src_folders, _vfs_disks, _vfs_upload_src
+    with _vfs_lock:
+        _vfs_src_folders = [p for p in (src_folders or []) if p and os.path.isdir(p)]
+        _vfs_disks = [d for d in (disks or []) if d.get('path') and os.path.isdir(d['path'])]
+        _vfs_upload_src = upload_src if upload_src and os.path.isdir(upload_src) else None
 
 
-def get_vfs_base_paths():
-    with _vfs_base_paths_lock:
-        return list(_vfs_base_paths)
+def get_vfs_search_paths():
+    """Get all paths to search for files (src_folders + disks)."""
+    with _vfs_lock:
+        paths = []
+        # Add source folders (input directories)
+        for path in _vfs_src_folders:
+            if path not in paths:
+                paths.append(path)
+        # Add disk paths
+        for disk in _vfs_disks:
+            disk_path = disk.get('path')
+            if disk_path and disk_path not in paths:
+                paths.append(disk_path)
+        return paths
+
+
+def get_vfs_write_path(upload_subpath=None):
+    """Get the primary path for writing new files (upload_src or first src_folder)."""
+    with _vfs_lock:
+        base = _vfs_upload_src
+        if not base and _vfs_src_folders:
+            base = _vfs_src_folders[0]
+        if not base:
+            return None
+        if upload_subpath:
+            return os.path.join(base, upload_subpath)
+        return base
 
 
 def normalize_virtual_path(virtual_path):
+    """Normalize a virtual path to absolute form starting with '/'."""
     if not virtual_path:
         return '/'
     path = virtual_path.strip()
     if not path.startswith('/'):
         path = '/' + path
-    return path
+    # Normalize .. and . in path
+    parts = path.split('/')
+    normalized = []
+    for part in parts:
+        if part == '' or part == '.':
+            continue
+        elif part == '..':
+            if normalized:
+                normalized.pop()
+        else:
+            normalized.append(part)
+    return '/' + '/'.join(normalized)
 
 
 def get_virtual_item_info(virtual_path):
-    """Returns (is_file, is_dir, physical_path) for a virtual path."""
+    """
+    Returns (is_file, is_dir, physical_path) for a virtual path.
+    Searches across all configured src_folders and disks.
+    """
     virt = normalize_virtual_path(virtual_path)
     if virt == '/':
         return False, True, None
+    
     rel = virt.lstrip('/')
-    for base in get_vfs_base_paths():
+    for base in get_vfs_search_paths():
         candidate = os.path.join(base, rel)
         if os.path.isfile(candidate):
             return True, False, candidate
@@ -131,29 +176,62 @@ def get_virtual_item_info(virtual_path):
 
 
 def list_virtual_dir(virtual_dir):
-    """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
+    """
+    Returns a dictionary mapping names to info dicts for children of virtual_dir.
+    Each info dict contains: full_virtual_path, is_file, is_dir, physical_path
+    Merges contents from all src_folders and disks.
+    """
     virt_dir = normalize_virtual_path(virtual_dir)
     rel = virt_dir.lstrip('/')
     seen = {}
-    for base in get_vfs_base_paths():
+    
+    for base in get_vfs_search_paths():
         scan_path = os.path.join(base, rel) if rel else base
         if not os.path.isdir(scan_path):
             continue
         try:
             for name in os.listdir(scan_path):
-                if name not in seen:
-                    full_virtual = virt_dir.rstrip('/') + '/' + name
-                    seen[name] = full_virtual
+                if name in seen:
+                    continue
+                full_virtual = virt_dir.rstrip('/') + '/' + name
+                physical_path = os.path.join(scan_path, name)
+                is_file = os.path.isfile(physical_path)
+                is_dir = os.path.isdir(physical_path)
+                seen[name] = {
+                    'full_virtual': full_virtual,
+                    'is_file': is_file,
+                    'is_dir': is_dir,
+                    'physical_path': physical_path
+                }
         except OSError:
             continue
     return seen
 
 
 def get_physical_path_for_virtual(virtual_path):
+    """Get the physical path for a virtual file path, or None if not found."""
     is_file, _is_dir, physical_path = get_virtual_item_info(virtual_path)
     if is_file:
         return physical_path
     return None
+
+
+def resolve_all_physical_paths(virtual_path):
+    """
+    Get all physical paths that match a virtual path across all disks.
+    Useful for operations that need to affect all copies.
+    """
+    virt = normalize_virtual_path(virtual_path)
+    if virt == '/':
+        return []
+    
+    rel = virt.lstrip('/')
+    paths = []
+    for base in get_vfs_search_paths():
+        candidate = os.path.join(base, rel)
+        if os.path.exists(candidate):
+            paths.append(candidate)
+    return paths
 
 
 def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
@@ -444,32 +522,48 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             os.makedirs(os.path.dirname(new_physical), exist_ok=True)
             os.rename(old_physical, new_physical)
 
-    async def start_server():
+    async def run_sftp_server():
+        """Run the SFTP server with proper async handling."""
         server_host_keys = None
+        
+        # Handle host keys
         if host_key_path and os.path.exists(host_key_path):
             server_host_keys = [host_key_path]
         else:
-            try:
-                generated_key = asyncssh.generate_private_key('ssh-ed25519')
-                server_host_keys = [generated_key]
-            except Exception:
-                server_host_keys = None
-
-        await asyncssh.listen(
+            # Generate or load persistent host key
+            persistent_key_path = os.path.join(current_dir, 'sftp_host_key')
+            if os.path.exists(persistent_key_path):
+                server_host_keys = [persistent_key_path]
+            else:
+                try:
+                    generated_key = asyncssh.generate_private_key('ssh-ed25519')
+                    # Save the key for persistence across restarts
+                    asyncssh.import_private_key(generated_key).write_private_key(persistent_key_path)
+                    server_host_keys = [persistent_key_path]
+                except Exception as e:
+                    print_and_discord(f"Failed to generate host key: {e}", webhook_url)
+                    server_host_keys = None
+        
+        if not server_host_keys:
+            raise RuntimeError("No server host keys available")
+        
+        # Start the server
+        server = await asyncssh.listen(
             host,
             port,
             server_factory=SimpleSSHServer,
             server_host_keys=server_host_keys,
             sftp_factory=SimpleSFTPServer,
         )
+        
+        print_and_discord(f"SFTP server started on {host}:{port}", webhook_url)
+        
+        # Keep server running
+        await asyncio.Event().wait()
 
     def run_server():
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(start_server())
-            print_and_discord(f"SFTP server started on {host}:{port}", webhook_url)
-            loop.run_forever()
+            asyncio.run(run_sftp_server())
         except Exception as e:
             print_and_discord(f"Could not start SFTP server: {e}", webhook_url)
 
@@ -477,13 +571,15 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
 def create_virtual_fuse_class():
     class VirtualFUSE(Operations):
-        def __init__(self, upload_src_path):
-            self.upload_src_path = upload_src_path
-            os.makedirs(self.upload_src_path, exist_ok=True)
+        def __init__(self):
+            pass
 
-        def _upload_physical_path(self, path):
+        def _get_write_path(self, path):
             rel = path.lstrip('/')
-            return os.path.join(self.upload_src_path, rel) if rel else self.upload_src_path
+            write_base = get_vfs_write_path()
+            if not write_base:
+                return None
+            return os.path.join(write_base, rel) if rel else write_base
 
         def getattr(self, path, fh=None):
             is_file, is_dir, physical_path = get_virtual_item_info(path)
@@ -516,10 +612,9 @@ def create_virtual_fuse_class():
             return os.open(physical_path, flags)
 
         def create(self, path, mode, fi=None):
-            rel = path.lstrip('/')
-            if not rel:
-                raise FuseOSError(errno.EINVAL)
-            physical_path = os.path.join(self.upload_src_path, rel)
+            physical_path = self._get_write_path(path)
+            if not physical_path:
+                raise FuseOSError(errno.EROFS)
             os.makedirs(os.path.dirname(physical_path), exist_ok=True)
             return os.open(physical_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
 
@@ -544,44 +639,69 @@ def create_virtual_fuse_class():
             return os.close(fh)
 
         def unlink(self, path):
-            physical_path = get_physical_path_for_virtual(path)
-            if physical_path and os.path.exists(physical_path):
-                os.remove(physical_path)
-            else:
+            physical_paths = resolve_all_physical_paths(path)
+            removed = False
+            for physical_path in physical_paths:
+                if os.path.isfile(physical_path):
+                    try:
+                        os.remove(physical_path)
+                        removed = True
+                    except OSError as exc:
+                        if not removed:
+                            raise FuseOSError(exc.errno) from exc
+            if not removed:
                 raise FuseOSError(errno.ENOENT)
 
         def mkdir(self, path, mode):
-            physical_path = self._upload_physical_path(path)
-            os.makedirs(physical_path, exist_ok=True)
+            physical_path = self._get_write_path(path)
+            if not physical_path:
+                raise FuseOSError(errno.EROFS)
+            try:
+                os.makedirs(physical_path, exist_ok=True)
+            except OSError as exc:
+                raise FuseOSError(exc.errno) from exc
 
         def rmdir(self, path):
             is_file, is_dir, physical_path = get_virtual_item_info(path)
-            if not is_dir:
-                raise FuseOSError(errno.ENOENT)
-            if physical_path and os.path.isdir(physical_path):
-                try:
-                    os.rmdir(physical_path)
-                    return
-                except OSError as exc:
-                    raise FuseOSError(exc.errno) from exc
-            rel = path.lstrip('/')
-            for base in get_vfs_base_paths():
-                candidate = os.path.join(base, rel)
+            if is_file:
+                raise FuseOSError(errno.ENOTDIR)
+            
+            # Try to remove from all locations
+            all_paths = resolve_all_physical_paths(path)
+            removed = False
+            for candidate in all_paths:
                 if os.path.isdir(candidate):
                     try:
                         os.rmdir(candidate)
-                        return
+                        removed = True
                     except OSError as exc:
-                        raise FuseOSError(exc.errno) from exc
-            raise FuseOSError(errno.ENOENT)
+                        if not removed:
+                            raise FuseOSError(exc.errno) from exc
+            
+            if not removed and not is_dir:
+                raise FuseOSError(errno.ENOENT)
 
         def rename(self, old, new):
             is_file, is_dir, old_physical = get_virtual_item_info(old)
             if not old_physical or not os.path.exists(old_physical):
                 raise FuseOSError(errno.ENOENT)
-            new_physical = self._upload_physical_path(new)
-            os.makedirs(os.path.dirname(new_physical), exist_ok=True)
-            os.rename(old_physical, new_physical)
+            
+            # Check if target exists
+            new_is_file, new_is_dir, new_existing = get_virtual_item_info(new)
+            
+            if new_existing and os.path.exists(new_existing):
+                new_physical = new_existing
+            else:
+                new_physical = self._get_write_path(new)
+            
+            if not new_physical:
+                raise FuseOSError(errno.EROFS)
+            
+            try:
+                os.makedirs(os.path.dirname(new_physical), exist_ok=True)
+                os.rename(old_physical, new_physical)
+            except OSError as exc:
+                raise FuseOSError(exc.errno) from exc
 
     return VirtualFUSE
 
@@ -604,7 +724,7 @@ def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
         try:
             print_and_discord(f"Starting FUSE mount at {mount_point}", webhook_url)
             cls = create_virtual_fuse_class()
-            FUSE(cls(upload_src_path), mount_point, nothreads=True, foreground=True)
+            FUSE(cls(), mount_point, nothreads=False, foreground=True)
         except Exception as e:
             print_and_discord(f"FUSE mount failed: {e}", webhook_url)
 
@@ -1487,8 +1607,8 @@ def main():
         src_folders.append(fuse_upload_src)
     start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
-    all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
-    set_vfs_base_paths(all_vfs_paths)
+    # Initialize VFS with dynamic configuration
+    set_vfs_config(src_folders, disks, sftp_upload_src if sftp_enabled else (fuse_upload_src if fuse_enabled else None))
 
     while True:
         try:

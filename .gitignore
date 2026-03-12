@@ -18,6 +18,7 @@ env/
 # Runtime generated files
 config.yml
 virtual_index.yml
+sftp_host_key
 *.log
 
 # IDE
