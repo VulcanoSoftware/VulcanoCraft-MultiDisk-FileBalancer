@@ -305,6 +305,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         def __init__(self, chan):
             self._upload_src_path = upload_src_path
             os.makedirs(self._upload_src_path, exist_ok=True)
+            self._dir_handles = {}
             super().__init__(chan)
 
         def _normalize_virtual(self, path):
@@ -328,10 +329,10 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             virt = self._normalize_virtual(path)
             return virt.encode('utf-8')
 
-        def listdir(self, path):
+        def opendir(self, path):
             virt_dir = self._normalize_virtual(path)
             names = list_virtual_dir(virt_dir)
-            result = []
+            entries = []
             for name, full_virtual in sorted(names.items()):
                 is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
                 if physical_path and os.path.exists(physical_path):
@@ -344,19 +345,36 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                         permissions=mode,
                         atime=now,
                         mtime=now,
+                        size=0
                     )
-                result.append(SFTPName(name.encode('utf-8'), '', attrs))
-            return result
+                entries.append(SFTPName(name.encode('utf-8'), None, attrs))
+
+            handle = os.urandom(8)
+            self._dir_handles[handle] = entries
+            return handle
+
+        def readdir(self, handle):
+            if handle not in self._dir_handles:
+                raise asyncssh.SFTPBadMessage('Invalid directory handle')
+
+            entries = self._dir_handles[handle]
+            if not entries:
+                return None
+
+            return entries.pop(0)
+
+        def closedir(self, handle):
+            self._dir_handles.pop(handle, None)
 
         async def stat(self, path, follow_symlinks=True):
             virt = self._normalize_virtual(path)
             is_file, is_dir, physical_path = get_virtual_item_info(virt)
             if physical_path and os.path.exists(physical_path):
-                return os.stat(physical_path)
+                return SFTPAttrs.from_local(os.stat(physical_path))
             if is_dir:
                 mode = stat.S_IFDIR | 0o755
                 now = int(time.time())
-                return os.stat_result((mode, 0, 0, 0, 0, 0, 0, now, now, now))
+                return SFTPAttrs(permissions=mode, atime=now, mtime=now)
             raise asyncssh.SFTPNoSuchFile(virt)
 
         def _mode_from_pflags(self, pflags):
@@ -961,6 +979,7 @@ def send_discord_message(message, webhook_url):
 
 def print_and_discord(message, webhook_url):
     print(message)
+    sys.stdout.flush()
     send_discord_message(message, webhook_url)
 
 def get_next_disk(current_disk, disks):
@@ -1242,7 +1261,7 @@ def main():
     if not last_disk and disks:
         last_disk = disks[0]['name']
 
-    if not space_hunter_disks:
+    if not space_hunter_disks and not config_exists:
         use_space_hunter = input("Do you want to enable automatic disk space checks and cleanup? (yes/no): ").lower() == 'yes'
         if use_space_hunter:
             min_space_input = input(f"Default minimum free space in GB for space hunter (default {space_check_default_min_free_gb}): ").strip()
