@@ -339,6 +339,13 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         async def scandir(self, path):
             virt_dir = self._normalize_virtual(path)
             names = list_virtual_dir(virt_dir)
+
+            # Add standard directory entries
+            for name in ('.', '..'):
+                now = int(time.time())
+                attrs = SFTPAttrs(permissions=stat.S_IFDIR | 0o755, atime=now, mtime=now, size=0)
+                yield SFTPName(name.encode('utf-8'), None, attrs)
+
             for name, full_virtual in sorted(names.items()):
                 is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
                 if physical_path and os.path.exists(physical_path):
@@ -460,7 +467,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     async def start_server():
         try:
-            print_and_discord(f"Starting SFTP server on {host}:{port}...", webhook_url)
+            print_and_discord(f"Starting SFTP server (asyncssh {asyncssh.__version__}) on {host}:{port}...", webhook_url)
             server_host_keys = []
             if host_key_path and os.path.exists(host_key_path):
                 server_host_keys = [host_key_path]
@@ -487,7 +494,8 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 sftp_factory=SimpleSFTPServer,
             )
 
-            print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
+            actual_host, actual_port = server.sockets[0].getsockname()[:2]
+            print_and_discord(f"SFTP server listening on {actual_host}:{actual_port} (configured as {host}:{port})", webhook_url)
             if host == '127.0.0.1':
                 print_and_discord("Warning: SFTP server is bound to 127.0.0.1. External connections (including via VirtualBox port forwarding) may not work. Consider using 0.0.0.0.", webhook_url)
             await server.wait_closed()
