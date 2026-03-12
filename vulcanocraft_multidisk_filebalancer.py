@@ -293,7 +293,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     class SimpleSSHServer(asyncssh.SSHServer):
         def connection_made(self, conn):
-            print_and_discord(f"SSH connection received from {conn.get_extra_info('peername')}", webhook_url)
+            peer = conn.get_extra_info('peername')
+            local = conn.get_extra_info('sockname')
+            print_and_discord(f"SSH connection received from {peer} to local address {local}", webhook_url)
 
         def connection_lost(self, exc):
             if exc:
@@ -474,6 +476,16 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     async def start_server():
         try:
             import socket
+
+            # Check if port is already in use
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((host, port))
+                except socket.error:
+                    print_and_discord(f"ERROR: SFTP Port {port} is already in use by another process!", webhook_url)
+                    print_and_discord(f"Use 'ss -tlnp | grep {port}' to find the conflicting process.", webhook_url)
+                    return
+
             hostname = socket.gethostname()
             local_ips = [socket.gethostbyname(hostname)]
             try:
@@ -513,7 +525,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             )
 
             actual_host, actual_port = server.sockets[0].getsockname()[:2]
-            print_and_discord(f"SFTP server listening on {actual_host}:{actual_port} (configured as {host}:{port})", webhook_url)
+            print_and_discord(f"SUCCESS: SFTP server is READY and listening on {actual_host}:{actual_port}", webhook_url)
             if host == '127.0.0.1':
                 print_and_discord("CRITICAL WARNING: SFTP server is bound ONLY to 127.0.0.1.", webhook_url)
                 print_and_discord("Connections from OUTSIDE the VM (including VirtualBox port forwarding) will fail.", webhook_url)
