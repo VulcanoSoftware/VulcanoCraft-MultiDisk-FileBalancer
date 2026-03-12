@@ -366,16 +366,23 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         def closedir(self, handle):
             self._dir_handles.pop(handle, None)
 
-        async def stat(self, path, follow_symlinks=True):
+        async def _stat_helper(self, path, follow_symlinks=True):
             virt = self._normalize_virtual(path)
             is_file, is_dir, physical_path = get_virtual_item_info(virt)
             if physical_path and os.path.exists(physical_path):
-                return SFTPAttrs.from_local(os.stat(physical_path))
+                st = os.stat(physical_path) if follow_symlinks else os.lstat(physical_path)
+                return SFTPAttrs.from_local(st)
             if is_dir:
                 mode = stat.S_IFDIR | 0o755
                 now = int(time.time())
-                return SFTPAttrs(permissions=mode, atime=now, mtime=now)
+                return SFTPAttrs(permissions=mode, atime=now, mtime=now, size=0)
             raise asyncssh.SFTPNoSuchFile(virt)
+
+        async def stat(self, path):
+            return await self._stat_helper(path, follow_symlinks=True)
+
+        async def lstat(self, path):
+            return await self._stat_helper(path, follow_symlinks=False)
 
         def _mode_from_pflags(self, pflags):
             read = bool(pflags & FXF_READ)
@@ -463,17 +470,26 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             os.rename(old_physical, new_physical)
 
     async def start_server():
-        server_host_keys = None
+        print_and_discord(f"Starting SFTP server on {host}:{port}...", webhook_url)
+        server_host_keys = []
         if host_key_path and os.path.exists(host_key_path):
             server_host_keys = [host_key_path]
         else:
             try:
-                generated_key = asyncssh.generate_private_key('ssh-ed25519')
-                server_host_keys = [generated_key]
+                ed25519_key = asyncssh.generate_private_key('ssh-ed25519')
+                server_host_keys.append(ed25519_key)
             except Exception:
-                server_host_keys = None
+                pass
+            try:
+                rsa_key = asyncssh.generate_private_key('ssh-rsa')
+                server_host_keys.append(rsa_key)
+            except Exception:
+                pass
 
-        await asyncssh.listen(
+        if not server_host_keys:
+            server_host_keys = None
+
+        server = await asyncssh.listen(
             host,
             port,
             server_factory=SimpleSSHServer,
@@ -481,13 +497,14 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             sftp_factory=SimpleSFTPServer,
         )
 
+        print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
+        await server.wait_closed()
+
     def run_server():
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(start_server())
-            print_and_discord(f"SFTP server started on {host}:{port}", webhook_url)
-            loop.run_forever()
         except Exception as e:
             print_and_discord(f"Could not start SFTP server: {e}", webhook_url)
 
