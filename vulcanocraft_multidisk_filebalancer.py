@@ -295,6 +295,12 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         def connection_made(self, conn):
             print_and_discord(f"SSH connection received from {conn.get_extra_info('peername')}", webhook_url)
 
+        def connection_lost(self, exc):
+            if exc:
+                print_and_discord(f"SSH connection lost with error: {exc}", webhook_url)
+            else:
+                print_and_discord(f"SSH connection closed", webhook_url)
+
         def begin_auth(self, username):
             return True
 
@@ -467,7 +473,19 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
 
     async def start_server():
         try:
+            import socket
+            hostname = socket.gethostname()
+            local_ips = [socket.gethostbyname(hostname)]
+            try:
+                # Add all interface IPs on Linux
+                import subprocess
+                res = subprocess.run(['hostname', '-I'], capture_output=True, text=True)
+                local_ips.extend(res.stdout.split())
+            except Exception:
+                pass
+            unique_ips = sorted(list(set(local_ips)))
             print_and_discord(f"Starting SFTP server (asyncssh {asyncssh.__version__}) on {host}:{port}...", webhook_url)
+            print_and_discord(f"Detected VM IPs: {', '.join(unique_ips)}", webhook_url)
             server_host_keys = []
             if host_key_path and os.path.exists(host_key_path):
                 server_host_keys = [host_key_path]
@@ -497,7 +515,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             actual_host, actual_port = server.sockets[0].getsockname()[:2]
             print_and_discord(f"SFTP server listening on {actual_host}:{actual_port} (configured as {host}:{port})", webhook_url)
             if host == '127.0.0.1':
-                print_and_discord("Warning: SFTP server is bound to 127.0.0.1. External connections (including via VirtualBox port forwarding) may not work. Consider using 0.0.0.0.", webhook_url)
+                print_and_discord("CRITICAL WARNING: SFTP server is bound ONLY to 127.0.0.1.", webhook_url)
+                print_and_discord("Connections from OUTSIDE the VM (including VirtualBox port forwarding) will fail.", webhook_url)
+                print_and_discord("Please set 'host: 0.0.0.0' in config.yml to allow external connections.", webhook_url)
             await server.wait_closed()
         except Exception as e:
             print_and_discord(f"SFTP server error during startup or execution: {e}", webhook_url)
@@ -981,7 +1001,8 @@ def read_config(config_path=config_path):
     if os.path.exists(config_path):
         with open(config_path, 'r') as yaml_file:
             config_data = yaml.safe_load(yaml_file)
-            print(f"Config data loaded: {config_data}")
+            print(f"Config loaded from: {os.path.abspath(config_path)}")
+            print(f"Config data: {config_data}")
             return config_data
     return None
 
