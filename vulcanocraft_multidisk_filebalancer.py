@@ -292,6 +292,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     host_key_path = sftp_config.get('host_key_path')
 
     class SimpleSSHServer(asyncssh.SSHServer):
+        def connection_made(self, conn):
+            print_and_discord(f"SSH connection received from {conn.get_extra_info('peername')}", webhook_url)
+
         def begin_auth(self, username):
             return True
 
@@ -299,7 +302,12 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             return True
 
         def validate_password(self, username, password):
-            return username == username_cfg and password == password_cfg
+            is_valid = (username == username_cfg and password == password_cfg)
+            if not is_valid:
+                print_and_discord(f"SFTP login failed for user: {username}", webhook_url)
+            else:
+                print_and_discord(f"SFTP login successful for user: {username}", webhook_url)
+            return is_valid
 
     class SimpleSFTPServer(asyncssh.SFTPServer):
         def __init__(self, chan):
@@ -498,6 +506,8 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
         )
 
         print_and_discord(f"SFTP server listening on {host}:{port}", webhook_url)
+        if host == '127.0.0.1':
+            print_and_discord("Warning: SFTP server is bound to 127.0.0.1. External connections (including via VirtualBox port forwarding) may not work. Consider using 0.0.0.0.", webhook_url)
         await server.wait_closed()
 
     def run_server():
