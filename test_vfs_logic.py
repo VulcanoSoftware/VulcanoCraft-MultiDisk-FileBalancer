@@ -2,7 +2,7 @@ import os
 import shutil
 import yaml
 import time
-from vulcanocraft_multidisk_filebalancer import set_vfs_base_paths, list_virtual_dir
+from vulcanocraft_multidisk_filebalancer import set_vfs_base_paths, list_virtual_dir, initialize_virtual_index
 
 def test():
     for d in ['src1', 'src2', 'disk1']:
@@ -15,6 +15,7 @@ def test():
 
     paths = [os.path.abspath('src1'), os.path.abspath('src2'), os.path.abspath('disk1')]
     set_vfs_base_paths(paths)
+    initialize_virtual_index()
 
     print(f"VFS paths: {paths}")
     res = list_virtual_dir('/')

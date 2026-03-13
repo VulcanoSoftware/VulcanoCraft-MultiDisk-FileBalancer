@@ -93,6 +93,8 @@ config_path = os.path.join(current_dir, "config.yml")
 
 _vfs_base_paths = []
 _vfs_base_paths_lock = threading.Lock()
+_virtual_index = {}
+_virtual_index_lock = threading.Lock()
 
 
 def set_vfs_base_paths(paths):
@@ -104,6 +106,22 @@ def set_vfs_base_paths(paths):
 def get_vfs_base_paths():
     with _vfs_base_paths_lock:
         return list(_vfs_base_paths)
+
+
+def initialize_virtual_index():
+    paths = get_vfs_base_paths()
+    new_index = {}
+    for base_path in paths:
+        if not os.path.isdir(base_path):
+            continue
+        for root, _, files in os.walk(base_path):
+            for filename in files:
+                # Flat view: filename is the key.
+                # If multiple files have the same name in different folders, the last one found wins.
+                new_index[filename] = os.path.join(root, filename)
+    with _virtual_index_lock:
+        _virtual_index.clear()
+        _virtual_index.update(new_index)
 
 
 def normalize_virtual_path(virtual_path):
@@ -121,6 +139,13 @@ def get_virtual_item_info(virtual_path):
     if virt == '/':
         return False, True, None
     rel = virt.lstrip('/')
+
+    # Check the flat virtual index first for root-level file requests
+    if '/' not in rel:
+        with _virtual_index_lock:
+            if rel in _virtual_index:
+                return True, False, _virtual_index[rel]
+
     for base in get_vfs_base_paths():
         candidate = os.path.join(base, rel)
         if os.path.isfile(candidate):
@@ -133,6 +158,26 @@ def get_virtual_item_info(virtual_path):
 def list_virtual_dir(virtual_dir):
     """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
     virt_dir = normalize_virtual_path(virtual_dir)
+
+    # If listing root, provide the flat view of all files from the index
+    if virt_dir == '/':
+        seen = {}
+        with _virtual_index_lock:
+            for name in _virtual_index:
+                seen[name] = '/' + name
+        # Also include top-level directories from the base paths for compatibility
+        for base in get_vfs_base_paths():
+            if not os.path.isdir(base):
+                continue
+            try:
+                for name in os.listdir(base):
+                    full_path = os.path.join(base, name)
+                    if os.path.isdir(full_path) and name not in seen:
+                        seen[name] = '/' + name
+            except OSError:
+                continue
+        return seen
+
     rel = virt_dir.lstrip('/')
     seen = {}
     for base in get_vfs_base_paths():
@@ -1566,6 +1611,7 @@ def main():
     while True:
         all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
         set_vfs_base_paths(all_vfs_paths)
+        initialize_virtual_index()
         try:
             valid_src_folders = []
             for source_folder in src_folders:
