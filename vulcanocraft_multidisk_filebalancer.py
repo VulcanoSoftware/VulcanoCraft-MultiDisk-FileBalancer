@@ -281,6 +281,193 @@ def start_s3_server_thread(s3_config, upload_src_path, webhook_url):
     threading.Thread(target=run_server, daemon=True).start()
 
 
+class SimpleSSHServer(asyncssh.SSHServer):
+    def __init__(self, username, password, webhook_url):
+        self._username = username
+        self._password = password
+        self._webhook_url = webhook_url
+
+    def connection_made(self, conn):
+        peer = conn.get_extra_info('peername')
+        local = conn.get_extra_info('sockname')
+        print_and_discord(f"SSH connection received from {peer} to local address {local}", self._webhook_url)
+
+    def connection_lost(self, exc):
+        if exc:
+            print_and_discord(f"SSH connection lost with error: {exc}", self._webhook_url)
+        else:
+            print_and_discord(f"SSH connection closed", self._webhook_url)
+
+    def begin_auth(self, username):
+        return True
+
+    def password_auth_supported(self):
+        return True
+
+    def validate_password(self, username, password):
+        is_valid = (username == self._username and password == self._password)
+        if not is_valid:
+            print_and_discord(f"SFTP login failed for user: {username}", self._webhook_url)
+        else:
+            print_and_discord(f"SFTP login successful for user: {username}", self._webhook_url)
+        return is_valid
+
+class SimpleSFTPServer(asyncssh.SFTPServer):
+    def __init__(self, chan, upload_src_path):
+        self._upload_src_path = upload_src_path
+        os.makedirs(self._upload_src_path, exist_ok=True)
+        super().__init__(chan)
+
+    def _normalize_virtual(self, path):
+        if isinstance(path, bytes):
+            path_str = path.decode('utf-8', errors='ignore')
+        else:
+            path_str = str(path)
+        if path_str in ('', '.', './', '/.', '/'):
+            return '/'
+        return normalize_virtual_path(path_str)
+
+    def _upload_physical_path(self, virt):
+        rel = virt.lstrip('/')
+        return os.path.join(self._upload_src_path, rel) if rel else self._upload_src_path
+
+    def canonicalize(self, path):
+        virt = self._normalize_virtual(path)
+        return virt.encode('utf-8')
+
+    def realpath(self, path):
+        virt = self._normalize_virtual(path)
+        return virt.encode('utf-8')
+
+    async def scandir(self, path):
+        virt_dir = self._normalize_virtual(path)
+        names = list_virtual_dir(virt_dir)
+
+        # Add standard directory entries
+        for name in ('.', '..'):
+            now = int(time.time())
+            attrs = SFTPAttrs(permissions=stat.S_IFDIR | 0o755, atime=now, mtime=now, size=0)
+            yield SFTPName(name.encode('utf-8'), None, attrs)
+
+        for name, full_virtual in sorted(names.items()):
+            is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
+            if physical_path and os.path.exists(physical_path):
+                st = os.stat(physical_path)
+                attrs = SFTPAttrs.from_local(st)
+            else:
+                mode = stat.S_IFDIR | 0o755 if is_dir else stat.S_IFREG | 0o644
+                now = int(time.time())
+                attrs = SFTPAttrs(
+                    permissions=mode,
+                    atime=now,
+                    mtime=now,
+                    size=0
+                )
+            yield SFTPName(name.encode('utf-8'), None, attrs)
+
+    async def _stat_helper(self, path, follow_symlinks=True):
+        virt = self._normalize_virtual(path)
+        is_file, is_dir, physical_path = get_virtual_item_info(virt)
+        if physical_path and os.path.exists(physical_path):
+            st = os.stat(physical_path) if follow_symlinks else os.lstat(physical_path)
+            return SFTPAttrs.from_local(st)
+        if is_dir:
+            mode = stat.S_IFDIR | 0o755
+            now = int(time.time())
+            return SFTPAttrs(permissions=mode, atime=now, mtime=now, size=0)
+        raise asyncssh.SFTPNoSuchFile(virt)
+
+    async def stat(self, path):
+        return await self._stat_helper(path, follow_symlinks=True)
+
+    async def lstat(self, path):
+        return await self._stat_helper(path, follow_symlinks=False)
+
+    def _mode_from_pflags(self, pflags):
+        read = bool(pflags & FXF_READ)
+        write = bool(pflags & FXF_WRITE)
+        append = bool(pflags & FXF_APPEND)
+        creat = bool(pflags & FXF_CREAT)
+        trunc = bool(pflags & FXF_TRUNC)
+        if read and not write:
+            return 'rb'
+        if write and not read:
+            if append and not trunc:
+                return 'ab'
+            if trunc or creat:
+                return 'wb'
+            return 'wb'
+        if read and write:
+            if append and not trunc:
+                return 'a+b'
+            if trunc or creat:
+                return 'w+b'
+            return 'r+b'
+        return 'rb'
+
+    async def open(self, path, pflags, attrs):
+        virt = self._normalize_virtual(path)
+        write = bool(pflags & FXF_WRITE)
+        if write:
+            rel = virt.lstrip('/')
+            if not rel:
+                raise asyncssh.SFTPFailure('Invalid file name')
+            physical_path = os.path.join(self._upload_src_path, rel)
+            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
+        else:
+            physical_path = get_physical_path_for_virtual(virt)
+            if not physical_path or not os.path.exists(physical_path):
+                raise asyncssh.SFTPNoSuchFile(virt)
+        mode = self._mode_from_pflags(pflags)
+        f = open(physical_path, mode)
+        return f
+
+    async def remove(self, path):
+        virt = self._normalize_virtual(path)
+        physical_path = get_physical_path_for_virtual(virt)
+        if physical_path and os.path.exists(physical_path):
+            os.remove(physical_path)
+            return
+        raise asyncssh.SFTPNoSuchFile(virt)
+
+    async def mkdir(self, path, attrs):
+        virt = self._normalize_virtual(path)
+        physical_path = self._upload_physical_path(virt)
+        os.makedirs(physical_path, exist_ok=True)
+
+    async def rmdir(self, path):
+        virt = self._normalize_virtual(path)
+        is_file, is_dir, physical_path = get_virtual_item_info(virt)
+        if not is_dir:
+            raise asyncssh.SFTPNoSuchFile(virt)
+        if physical_path and os.path.isdir(physical_path):
+            try:
+                os.rmdir(physical_path)
+            except OSError as exc:
+                raise asyncssh.SFTPFailure(str(exc)) from exc
+            return
+        rel = virt.lstrip('/')
+        for base in get_vfs_base_paths():
+            candidate = os.path.join(base, rel)
+            if os.path.isdir(candidate):
+                try:
+                    os.rmdir(candidate)
+                except OSError as exc:
+                    raise asyncssh.SFTPFailure(str(exc)) from exc
+                return
+        raise asyncssh.SFTPNoSuchFile(virt)
+
+    async def rename(self, oldpath, newpath, flags=0):
+        old_virt = self._normalize_virtual(oldpath)
+        new_virt = self._normalize_virtual(newpath)
+        is_file, is_dir, old_physical = get_virtual_item_info(old_virt)
+        if not old_physical or not os.path.exists(old_physical):
+            raise asyncssh.SFTPNoSuchFile(old_virt)
+        new_rel = new_virt.lstrip('/')
+        new_physical = os.path.join(self._upload_src_path, new_rel)
+        os.makedirs(os.path.dirname(new_physical), exist_ok=True)
+        os.rename(old_physical, new_physical)
+
 def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     if not sftp_config.get('enabled', False):
         return
@@ -290,188 +477,6 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
     username_cfg = sftp_config.get('username', 'raiduser')
     password_cfg = sftp_config.get('password', 'changeme')
     host_key_path = sftp_config.get('host_key_path')
-
-    class SimpleSSHServer(asyncssh.SSHServer):
-        def connection_made(self, conn):
-            peer = conn.get_extra_info('peername')
-            local = conn.get_extra_info('sockname')
-            print_and_discord(f"SSH connection received from {peer} to local address {local}", webhook_url)
-
-        def connection_lost(self, exc):
-            if exc:
-                print_and_discord(f"SSH connection lost with error: {exc}", webhook_url)
-            else:
-                print_and_discord(f"SSH connection closed", webhook_url)
-
-        def begin_auth(self, username):
-            return True
-
-        def password_auth_supported(self):
-            return True
-
-        def validate_password(self, username, password):
-            is_valid = (username == username_cfg and password == password_cfg)
-            if not is_valid:
-                print_and_discord(f"SFTP login failed for user: {username}", webhook_url)
-            else:
-                print_and_discord(f"SFTP login successful for user: {username}", webhook_url)
-            return is_valid
-
-    class SimpleSFTPServer(asyncssh.SFTPServer):
-        def __init__(self, chan):
-            self._upload_src_path = upload_src_path
-            os.makedirs(self._upload_src_path, exist_ok=True)
-            super().__init__(chan)
-
-        def _normalize_virtual(self, path):
-            if isinstance(path, bytes):
-                path_str = path.decode('utf-8', errors='ignore')
-            else:
-                path_str = str(path)
-            if path_str in ('', '.', './', '/.', '/'):
-                return '/'
-            return normalize_virtual_path(path_str)
-
-        def _upload_physical_path(self, virt):
-            rel = virt.lstrip('/')
-            return os.path.join(self._upload_src_path, rel) if rel else self._upload_src_path
-
-        def canonicalize(self, path):
-            virt = self._normalize_virtual(path)
-            return virt.encode('utf-8')
-
-        def realpath(self, path):
-            virt = self._normalize_virtual(path)
-            return virt.encode('utf-8')
-
-        async def scandir(self, path):
-            virt_dir = self._normalize_virtual(path)
-            names = list_virtual_dir(virt_dir)
-
-            # Add standard directory entries
-            for name in ('.', '..'):
-                now = int(time.time())
-                attrs = SFTPAttrs(permissions=stat.S_IFDIR | 0o755, atime=now, mtime=now, size=0)
-                yield SFTPName(name.encode('utf-8'), None, attrs)
-
-            for name, full_virtual in sorted(names.items()):
-                is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
-                if physical_path and os.path.exists(physical_path):
-                    st = os.stat(physical_path)
-                    attrs = SFTPAttrs.from_local(st)
-                else:
-                    mode = stat.S_IFDIR | 0o755 if is_dir else stat.S_IFREG | 0o644
-                    now = int(time.time())
-                    attrs = SFTPAttrs(
-                        permissions=mode,
-                        atime=now,
-                        mtime=now,
-                        size=0
-                    )
-                yield SFTPName(name.encode('utf-8'), None, attrs)
-
-        async def _stat_helper(self, path, follow_symlinks=True):
-            virt = self._normalize_virtual(path)
-            is_file, is_dir, physical_path = get_virtual_item_info(virt)
-            if physical_path and os.path.exists(physical_path):
-                st = os.stat(physical_path) if follow_symlinks else os.lstat(physical_path)
-                return SFTPAttrs.from_local(st)
-            if is_dir:
-                mode = stat.S_IFDIR | 0o755
-                now = int(time.time())
-                return SFTPAttrs(permissions=mode, atime=now, mtime=now, size=0)
-            raise asyncssh.SFTPNoSuchFile(virt)
-
-        async def stat(self, path):
-            return await self._stat_helper(path, follow_symlinks=True)
-
-        async def lstat(self, path):
-            return await self._stat_helper(path, follow_symlinks=False)
-
-        def _mode_from_pflags(self, pflags):
-            read = bool(pflags & FXF_READ)
-            write = bool(pflags & FXF_WRITE)
-            append = bool(pflags & FXF_APPEND)
-            creat = bool(pflags & FXF_CREAT)
-            trunc = bool(pflags & FXF_TRUNC)
-            if read and not write:
-                return 'rb'
-            if write and not read:
-                if append and not trunc:
-                    return 'ab'
-                if trunc or creat:
-                    return 'wb'
-                return 'wb'
-            if read and write:
-                if append and not trunc:
-                    return 'a+b'
-                if trunc or creat:
-                    return 'w+b'
-                return 'r+b'
-            return 'rb'
-
-        async def open(self, path, pflags, attrs):
-            virt = self._normalize_virtual(path)
-            write = bool(pflags & FXF_WRITE)
-            if write:
-                rel = virt.lstrip('/')
-                if not rel:
-                    raise asyncssh.SFTPFailure('Invalid file name')
-                physical_path = os.path.join(self._upload_src_path, rel)
-                os.makedirs(os.path.dirname(physical_path), exist_ok=True)
-            else:
-                physical_path = get_physical_path_for_virtual(virt)
-                if not physical_path or not os.path.exists(physical_path):
-                    raise asyncssh.SFTPNoSuchFile(virt)
-            mode = self._mode_from_pflags(pflags)
-            f = open(physical_path, mode)
-            return f
-
-        async def remove(self, path):
-            virt = self._normalize_virtual(path)
-            physical_path = get_physical_path_for_virtual(virt)
-            if physical_path and os.path.exists(physical_path):
-                os.remove(physical_path)
-                return
-            raise asyncssh.SFTPNoSuchFile(virt)
-
-        async def mkdir(self, path, attrs):
-            virt = self._normalize_virtual(path)
-            physical_path = self._upload_physical_path(virt)
-            os.makedirs(physical_path, exist_ok=True)
-
-        async def rmdir(self, path):
-            virt = self._normalize_virtual(path)
-            is_file, is_dir, physical_path = get_virtual_item_info(virt)
-            if not is_dir:
-                raise asyncssh.SFTPNoSuchFile(virt)
-            if physical_path and os.path.isdir(physical_path):
-                try:
-                    os.rmdir(physical_path)
-                except OSError as exc:
-                    raise asyncssh.SFTPFailure(str(exc)) from exc
-                return
-            rel = virt.lstrip('/')
-            for base in get_vfs_base_paths():
-                candidate = os.path.join(base, rel)
-                if os.path.isdir(candidate):
-                    try:
-                        os.rmdir(candidate)
-                    except OSError as exc:
-                        raise asyncssh.SFTPFailure(str(exc)) from exc
-                    return
-            raise asyncssh.SFTPNoSuchFile(virt)
-
-        async def rename(self, oldpath, newpath, flags=0):
-            old_virt = self._normalize_virtual(oldpath)
-            new_virt = self._normalize_virtual(newpath)
-            is_file, is_dir, old_physical = get_virtual_item_info(old_virt)
-            if not old_physical or not os.path.exists(old_physical):
-                raise asyncssh.SFTPNoSuchFile(old_virt)
-            new_rel = new_virt.lstrip('/')
-            new_physical = os.path.join(self._upload_src_path, new_rel)
-            os.makedirs(os.path.dirname(new_physical), exist_ok=True)
-            os.rename(old_physical, new_physical)
 
     async def start_server():
         try:
@@ -519,9 +524,9 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             server = await asyncssh.listen(
                 host,
                 port,
-                server_factory=SimpleSSHServer,
+                server_factory=lambda: SimpleSSHServer(username_cfg, password_cfg, webhook_url),
                 server_host_keys=server_host_keys,
-                sftp_factory=SimpleSFTPServer,
+                sftp_factory=lambda chan: SimpleSFTPServer(chan, upload_src_path),
             )
 
             actual_host, actual_port = server.sockets[0].getsockname()[:2]
