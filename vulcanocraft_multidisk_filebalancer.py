@@ -1558,10 +1558,9 @@ def main():
         src_folders.append(fuse_upload_src)
     start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
-    all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
-    set_vfs_base_paths(all_vfs_paths)
-
     while True:
+        all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
+        set_vfs_base_paths(all_vfs_paths)
         try:
             valid_src_folders = []
             for source_folder in src_folders:
