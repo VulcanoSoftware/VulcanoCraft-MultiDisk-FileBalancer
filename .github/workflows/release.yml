@@ -35,7 +35,6 @@ jobs:
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
             pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
           elif [ "${{ matrix.os }}" == "macos-latest" ]; then
-            # Use icon.icns if it exists, otherwise fallback to icon.ico or no icon
             if [ -f "icon.icns" ]; then
               pyinstaller -i icon.icns --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
             else
@@ -102,6 +101,46 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Next Version
+        id: next_version
+        shell: bash
+        run: |
+          # Fetch the latest release tag
+          LATEST_TAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" | \
+            grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
+          echo "Latest tag found: $LATEST_TAG"
+
+          # Default if no releases exist
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
+            NEW_TAG="1.0"
+          else
+            # Remove leading 'v' if present
+            CLEAN_TAG=${LATEST_TAG#v}
+            # Split major and minor
+            MAJOR=$(echo $CLEAN_TAG | cut -d. -f1)
+            MINOR=$(echo $CLEAN_TAG | cut -d. -f2)
+
+            # Increment minor
+            NEW_MINOR=$((MINOR + 1))
+            NEW_MAJOR=$MAJOR
+
+            # If minor reaches 10, increment major and reset minor to 0
+            if [ $NEW_MINOR -ge 10 ]; then
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_MINOR=0
+            fi
+
+            NEW_TAG="${NEW_MAJOR}.${NEW_MINOR}"
+          fi
+
+          echo "New tag: $NEW_TAG"
+          echo "tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -111,8 +150,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Release Build ${{ github.run_number }}
+          tag_name: ${{ steps.next_version.outputs.tag }}
+          name: Release ${{ steps.next_version.outputs.tag }}
           files: ./artifacts/*
           draft: false
           prerelease: false
