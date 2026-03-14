@@ -30,8 +30,19 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
+        shell: bash
         run: |
-          pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+          elif [ "${{ matrix.os }}" == "macos-latest" ]; then
+            if [ -f "icon.icns" ]; then
+              pyinstaller -i icon.icns --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+            else
+              pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+            fi
+          else
+            pyinstaller --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+          fi
 
       - name: Prepare Linux packages
         if: matrix.os == 'ubuntu-latest'
@@ -39,26 +50,49 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ruby ruby-dev rubygems build-essential rpm
           sudo gem install --no-document fpm
-          mv dist/VulcanoCraft-MultiDisk-FileBalancer dist/VulcanoCraft-MultiDisk-FileBalancer-linux
-          fpm -s dir -t deb -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer-linux=/usr/bin/vulcanocraft-multidisk-filebalancer
-          fpm -s dir -t rpm -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer-linux=/usr/bin/vulcanocraft-multidisk-filebalancer
+          fpm -s dir -t deb -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer=/usr/bin/vulcanocraft-multidisk-filebalancer
+          fpm -s dir -t rpm -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer=/usr/bin/vulcanocraft-multidisk-filebalancer
 
-      - name: Prepare macOS executable
+      - name: Prepare macOS DMG
         if: matrix.os == 'macos-latest'
         run: |
-          mv dist/VulcanoCraft-MultiDisk-FileBalancer dist/VulcanoCraft-MultiDisk-FileBalancer-macos
+          brew install create-dmg
+          mkdir -p dist/dmg_content
+          cp dist/VulcanoCraft-MultiDisk-FileBalancer dist/dmg_content/
+          if [ -f "icon.icns" ]; then
+            create-dmg \
+              --volname "VulcanoCraft FileBalancer" \
+              --volicon "icon.icns" \
+              --window-pos 200 120 \
+              --window-size 600 400 \
+              --icon-size 100 \
+              --icon "VulcanoCraft-MultiDisk-FileBalancer" 200 190 \
+              --hide-extension "VulcanoCraft-MultiDisk-FileBalancer" \
+              "VulcanoCraft-MultiDisk-FileBalancer.dmg" \
+              "dist/dmg_content/"
+          else
+            hdiutil create -volname "VulcanoCraft FileBalancer" -srcfolder dist/dmg_content -ov -format UDZO VulcanoCraft-MultiDisk-FileBalancer.dmg
+          fi
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir staging
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp dist/VulcanoCraft-MultiDisk-FileBalancer.exe staging/
+          elif [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cp *.deb staging/
+            cp *.rpm staging/
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            cp *.dmg staging/
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts-${{ matrix.os }}
-          path: |
-            dist/VulcanoCraft-MultiDisk-FileBalancer.exe
-            dist/VulcanoCraft-MultiDisk-FileBalancer-linux
-            dist/VulcanoCraft-MultiDisk-FileBalancer-macos
-            *.deb
-            *.rpm
-          if-no-files-found: ignore
+          path: staging/*
+          if-no-files-found: error
 
   release:
     name: Create Release
@@ -67,6 +101,46 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Next Version
+        id: next_version
+        shell: bash
+        run: |
+          # Fetch the latest release tag
+          LATEST_TAG=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" | \
+            grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
+          echo "Latest tag found: $LATEST_TAG"
+
+          # Default if no releases exist
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
+            NEW_TAG="1.0"
+          else
+            # Remove leading 'v' if present
+            CLEAN_TAG=${LATEST_TAG#v}
+            # Split major and minor
+            MAJOR=$(echo $CLEAN_TAG | cut -d. -f1)
+            MINOR=$(echo $CLEAN_TAG | cut -d. -f2)
+
+            # Increment minor
+            NEW_MINOR=$((MINOR + 1))
+            NEW_MAJOR=$MAJOR
+
+            # If minor reaches 10, increment major and reset minor to 0
+            if [ $NEW_MINOR -ge 10 ]; then
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_MINOR=0
+            fi
+
+            NEW_TAG="${NEW_MAJOR}.${NEW_MINOR}"
+          fi
+
+          echo "New tag: $NEW_TAG"
+          echo "tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -76,14 +150,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Release Build ${{ github.run_number }}
-          files: |
-            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer.exe
-            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer-linux
-            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer-macos
-            ./artifacts/*.deb
-            ./artifacts/*.rpm
+          tag_name: ${{ steps.next_version.outputs.tag }}
+          name: ${{ steps.next_version.outputs.tag }}
+          files: ./artifacts/*
           draft: false
           prerelease: false
         env:
