@@ -12,6 +12,7 @@ import asyncssh
 import stat
 import errno
 import sys
+import hashlib
 from asyncssh.sftp import SFTPName, SFTPAttrs, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC
 
 def try_import_fuse():
@@ -106,6 +107,28 @@ def get_vfs_base_paths():
         return list(_vfs_base_paths)
 
 
+def _normalized_existing_path_entries(paths):
+    normalized_paths = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.normpath(str(path)))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_paths.append(path)
+    return normalized_paths
+
+
+def build_vfs_base_paths(src_folders, disks, extra_paths=None):
+    all_paths = list(src_folders)
+    all_paths.extend(d.get('path') or d.get('pad') for d in disks if isinstance(d, dict))
+    if extra_paths:
+        all_paths.extend(extra_paths)
+    return _normalized_existing_path_entries(all_paths)
+
+
 def normalize_virtual_path(virtual_path):
     if not virtual_path:
         return '/'
@@ -115,12 +138,49 @@ def normalize_virtual_path(virtual_path):
     return path
 
 
+def _build_flat_file_map(base_paths):
+    flat_map = {}
+    basename_records = {}
+    seen_physical_paths = set()
+    for base in base_paths:
+        if not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            for file_name in files:
+                physical_path = os.path.join(root, file_name)
+                norm_path = os.path.normcase(os.path.normpath(physical_path))
+                if norm_path in seen_physical_paths:
+                    continue
+                seen_physical_paths.add(norm_path)
+                basename_records.setdefault(file_name, []).append(physical_path)
+
+    for file_name, physical_paths in basename_records.items():
+        if len(physical_paths) == 1:
+            flat_map[file_name] = physical_paths[0]
+            continue
+        stem, ext = os.path.splitext(file_name)
+        for physical_path in physical_paths:
+            path_hash = hashlib.sha1(physical_path.encode('utf-8', errors='ignore')).hexdigest()[:8]
+            virtual_name = f"{stem}__{path_hash}{ext}"
+            flat_map[virtual_name] = physical_path
+
+    return flat_map
+
+
+def _build_flat_root_file_map():
+    return _build_flat_file_map(get_vfs_base_paths())
+
+
 def get_virtual_item_info(virtual_path):
     """Returns (is_file, is_dir, physical_path) for a virtual path."""
     virt = normalize_virtual_path(virtual_path)
     if virt == '/':
         return False, True, None
     rel = virt.lstrip('/')
+    if rel and '/' not in rel and '\\' not in rel:
+        flat_root_files = _build_flat_root_file_map()
+        if rel in flat_root_files:
+            return True, False, flat_root_files[rel]
     for base in get_vfs_base_paths():
         candidate = os.path.join(base, rel)
         if os.path.isfile(candidate):
@@ -133,6 +193,9 @@ def get_virtual_item_info(virtual_path):
 def list_virtual_dir(virtual_dir):
     """Returns a dictionary mapping names to full virtual paths for children of virtual_dir."""
     virt_dir = normalize_virtual_path(virtual_dir)
+    if virt_dir == '/':
+        flat_root_files = _build_flat_root_file_map()
+        return {name: '/' + name for name in flat_root_files}
     rel = virt_dir.lstrip('/')
     seen = {}
     for base in get_vfs_base_paths():
@@ -155,128 +218,46 @@ def get_physical_path_for_virtual(virtual_path):
         return physical_path
     return None
 
-
-def create_s3_handler(upload_src_path, access_key=None, secret_key=None):
-    class S3Handler(BaseHTTPRequestHandler):
-        def _is_authorized(self):
-            if not access_key and not secret_key:
-                return True
-            key = self.headers.get('X-Access-Key', '')
-            secret = self.headers.get('X-Secret-Key', '')
-            return key == access_key and secret == secret_key
-
-        def _send_unauthorized(self):
-            self.send_response(401)
-            self.end_headers()
-
-        def _safe_join_upload_path(self, raw_path):
-            path = raw_path
-            if path.startswith('/'):
-                path = path[1:]
-            rel_path = os.path.normpath(path.replace('/', os.sep))
-            if rel_path.startswith('..') or os.path.isabs(rel_path):
-                return None
-            return os.path.join(upload_src_path, rel_path)
-
-        def do_PUT(self):
-            if not self._is_authorized():
-                self._send_unauthorized()
-                return
-            parsed = urlparse(self.path)
-            path = unquote(parsed.path)
-            physical_path = self._safe_join_upload_path(path)
-            if not physical_path:
-                self.send_response(400)
-                self.end_headers()
-                return
-            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
-            lengte_header = self.headers.get('Content-Length')
-            lengte = int(lengte_header) if lengte_header and lengte_header.isdigit() else 0
-            met_error = False
-            try:
-                with open(physical_path, 'wb') as f:
-                    resterend = lengte
-                    while resterend > 0:
-                        chunk = self.rfile.read(min(65536, resterend))
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        resterend -= len(chunk)
-            except Exception:
-                met_error = True
-            if met_error:
-                self.send_response(500)
-            else:
-                self.send_response(200)
-            self.end_headers()
-
-        def do_GET(self):
-            if not self._is_authorized():
-                self._send_unauthorized()
-                return
-            parsed = urlparse(self.path)
-            query = parse_qs(parsed.query or '')
-            if 'list' in query:
-                prefix = normalize_virtual_path(unquote(parsed.path))
-                children = list_virtual_dir(prefix)
-                all_keys = sorted('/' + name for name in children)
-                content = "\n".join(all_keys)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(content.encode('utf-8'))
-                return
-            path = unquote(parsed.path)
-            physical_path = get_physical_path_for_virtual(path)
-            if not physical_path or not os.path.exists(physical_path):
-                self.send_response(404)
-                self.end_headers()
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.end_headers()
-            with open(physical_path, 'rb') as f:
-                shutil.copyfileobj(f, self.wfile)
-
-        def do_DELETE(self):
-            if not self._is_authorized():
-                self._send_unauthorized()
-                return
-            parsed = urlparse(self.path)
-            path = unquote(parsed.path)
-            physical_path = get_physical_path_for_virtual(path)
-            if physical_path and os.path.exists(physical_path):
-                try:
-                    os.remove(physical_path)
-                    self.send_response(200)
-                except Exception:
-                    self.send_response(500)
-            else:
-                self.send_response(404)
-            self.end_headers()
-
-        def log_message(self, format, *args):
-            return
-
-    return S3Handler
-
-
-def start_s3_server_thread(s3_config, upload_src_path, webhook_url):
-    if not s3_config.get('enabled', False):
+def start_webdav_server_thread(webdav_config, upload_src_path, webhook_url, serve_root_path=None):
+    if not webdav_config.get('enabled', False):
         return
-    host = s3_config.get('host', '0.0.0.0')
-    port = int(s3_config.get('port', 9000))
-    access_key = s3_config.get('access_key') or None
-    secret_key = s3_config.get('secret_key') or None
-    handler_cls = create_s3_handler(upload_src_path, access_key, secret_key)
+    
+    try:
+        from wsgidav.wsgidav_app import WsgiDAVApp
+        from cheroot import wsgi
+    except ImportError:
+        print_and_discord("WebDAV error: 'wsgidav' or 'cheroot' not installed. Check requirements.txt.", webhook_url)
+        return
+
+    host = webdav_config.get('host', '0.0.0.0')
+    port = int(webdav_config.get('port', 8080))
+    username = webdav_config.get('username')
+    password = webdav_config.get('password')
+    
+    # Use FUSE mount path if provided, otherwise fallback to upload_src
+    dav_root = serve_root_path if serve_root_path else upload_src_path
+    
+    auth_config = {"user_mapping": {"*": True}}
+    if username and password:
+        auth_config = {"user_mapping": {"*": {username: {"password": password}}}}
+
+    config = {
+        "host": host,
+        "port": port,
+        "provider_mapping": {"/": dav_root},
+        "simple_dc": auth_config,
+        "verbose": 1,
+    }
+
+    app = WsgiDAVApp(config)
 
     def run_server():
         try:
-            server = HTTPServer((host, port), handler_cls)
-            print_and_discord(f"S3 server started on {host}:{port}", webhook_url)
-            server.serve_forever()
+            server = wsgi.Server((host, port), app)
+            print_and_discord(f"WebDAV server started on {host}:{port}", webhook_url)
+            server.start()
         except Exception as e:
-            print_and_discord(f"Could not start S3 server: {e}", webhook_url)
+            print_and_discord(f"Could not start WebDAV server: {e}", webhook_url)
 
     threading.Thread(target=run_server, daemon=True).start()
 
@@ -313,8 +294,10 @@ class SimpleSSHServer(asyncssh.SSHServer):
         return is_valid
 
 class SimpleSFTPServer(asyncssh.SFTPServer):
-    def __init__(self, chan, upload_src_path):
+    def __init__(self, chan, upload_src_path, serve_root_path=None, serve_root_flat=False):
         self._upload_src_path = upload_src_path
+        self._serve_root_path = os.path.normpath(serve_root_path) if serve_root_path else None
+        self._serve_root_flat = bool(serve_root_flat and self._serve_root_path)
         os.makedirs(self._upload_src_path, exist_ok=True)
         super().__init__(chan)
 
@@ -331,6 +314,34 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
         rel = virt.lstrip('/')
         return os.path.join(self._upload_src_path, rel) if rel else self._upload_src_path
 
+    def _resolve_under_root(self, virt):
+        if not self._serve_root_path:
+            return False, False, None
+        if virt == '/':
+            return False, True, self._serve_root_path
+        rel = virt.lstrip('/').replace('/', os.sep)
+        candidate = os.path.normpath(os.path.join(self._serve_root_path, rel))
+        root_norm = os.path.normcase(os.path.normpath(self._serve_root_path))
+        candidate_norm = os.path.normcase(candidate)
+        if candidate_norm != root_norm and not candidate_norm.startswith(root_norm + os.sep):
+            return False, False, None
+        if os.path.isfile(candidate):
+            return True, False, candidate
+        if os.path.isdir(candidate):
+            return False, True, candidate
+        return False, False, None
+
+    def _resolve_virtual_item(self, virt):
+        if not self._serve_root_path:
+            return get_virtual_item_info(virt)
+        rel = virt.lstrip('/')
+        if self._serve_root_flat and rel and '/' not in rel and '\\' not in rel:
+            flat_files = _build_flat_file_map([self._serve_root_path])
+            physical_path = flat_files.get(rel)
+            if physical_path:
+                return True, False, physical_path
+        return self._resolve_under_root(virt)
+
     def canonicalize(self, path):
         virt = self._normalize_virtual(path)
         return virt.encode('utf-8')
@@ -341,7 +352,21 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def scandir(self, path):
         virt_dir = self._normalize_virtual(path)
-        names = list_virtual_dir(virt_dir)
+        if self._serve_root_path and self._serve_root_flat and virt_dir == '/':
+            names = {name: '/' + name for name in _build_flat_file_map([self._serve_root_path])}
+        elif self._serve_root_path:
+            is_file, is_dir, scan_path = self._resolve_under_root(virt_dir)
+            if not is_dir or not scan_path or not os.path.isdir(scan_path):
+                names = {}
+            else:
+                names = {}
+                try:
+                    for name in os.listdir(scan_path):
+                        names[name] = virt_dir.rstrip('/') + '/' + name
+                except OSError:
+                    names = {}
+        else:
+            names = list_virtual_dir(virt_dir)
 
         # Add standard directory entries
         for name in ('.', '..'):
@@ -350,7 +375,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
             yield SFTPName(name.encode('utf-8'), None, attrs)
 
         for name, full_virtual in sorted(names.items()):
-            is_file, is_dir, physical_path = get_virtual_item_info(full_virtual)
+            is_file, is_dir, physical_path = self._resolve_virtual_item(full_virtual)
             if physical_path and os.path.exists(physical_path):
                 st = os.stat(physical_path)
                 attrs = SFTPAttrs.from_local(st)
@@ -367,7 +392,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def _stat_helper(self, path, follow_symlinks=True):
         virt = self._normalize_virtual(path)
-        is_file, is_dir, physical_path = get_virtual_item_info(virt)
+        is_file, is_dir, physical_path = self._resolve_virtual_item(virt)
         if physical_path and os.path.exists(physical_path):
             st = os.stat(physical_path) if follow_symlinks else os.lstat(physical_path)
             return SFTPAttrs.from_local(st)
@@ -415,7 +440,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
             physical_path = os.path.join(self._upload_src_path, rel)
             os.makedirs(os.path.dirname(physical_path), exist_ok=True)
         else:
-            physical_path = get_physical_path_for_virtual(virt)
+            is_file, _is_dir, physical_path = self._resolve_virtual_item(virt)
             if not physical_path or not os.path.exists(physical_path):
                 raise asyncssh.SFTPNoSuchFile(virt)
         mode = self._mode_from_pflags(pflags)
@@ -424,7 +449,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def remove(self, path):
         virt = self._normalize_virtual(path)
-        physical_path = get_physical_path_for_virtual(virt)
+        is_file, _is_dir, physical_path = self._resolve_virtual_item(virt)
         if physical_path and os.path.exists(physical_path):
             os.remove(physical_path)
             return
@@ -437,7 +462,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def rmdir(self, path):
         virt = self._normalize_virtual(path)
-        is_file, is_dir, physical_path = get_virtual_item_info(virt)
+        is_file, is_dir, physical_path = self._resolve_virtual_item(virt)
         if not is_dir:
             raise asyncssh.SFTPNoSuchFile(virt)
         if physical_path and os.path.isdir(physical_path):
@@ -446,6 +471,8 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
             except OSError as exc:
                 raise asyncssh.SFTPFailure(str(exc)) from exc
             return
+        if self._serve_root_path:
+            raise asyncssh.SFTPNoSuchFile(virt)
         rel = virt.lstrip('/')
         for base in get_vfs_base_paths():
             candidate = os.path.join(base, rel)
@@ -460,7 +487,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
     async def rename(self, oldpath, newpath, flags=0):
         old_virt = self._normalize_virtual(oldpath)
         new_virt = self._normalize_virtual(newpath)
-        is_file, is_dir, old_physical = get_virtual_item_info(old_virt)
+        is_file, is_dir, old_physical = self._resolve_virtual_item(old_virt)
         if not old_physical or not os.path.exists(old_physical):
             raise asyncssh.SFTPNoSuchFile(old_virt)
         new_rel = new_virt.lstrip('/')
@@ -468,7 +495,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
         os.makedirs(os.path.dirname(new_physical), exist_ok=True)
         os.rename(old_physical, new_physical)
 
-def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
+def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url, serve_root_path=None, serve_root_flat=False):
     if not sftp_config.get('enabled', False):
         return
 
@@ -503,6 +530,8 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
             unique_ips = sorted(list(set(local_ips)))
             print_and_discord(f"Starting SFTP server (asyncssh {asyncssh.__version__}) on {host}:{port}...", webhook_url)
             print_and_discord(f"Detected VM IPs: {', '.join(unique_ips)}", webhook_url)
+            if serve_root_path:
+                print_and_discord(f"SFTP root mode: physical path {serve_root_path}", webhook_url)
             server_host_keys = []
             if host_key_path and os.path.exists(host_key_path):
                 server_host_keys = [host_key_path]
@@ -526,7 +555,12 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url):
                 port,
                 server_factory=lambda: SimpleSSHServer(username_cfg, password_cfg, webhook_url),
                 server_host_keys=server_host_keys,
-                sftp_factory=lambda chan: SimpleSFTPServer(chan, upload_src_path),
+                sftp_factory=lambda chan: SimpleSFTPServer(
+                    chan,
+                    upload_src_path,
+                    serve_root_path=serve_root_path,
+                    serve_root_flat=serve_root_flat,
+                ),
             )
 
             actual_host, actual_port = server.sockets[0].getsockname()[:2]
@@ -708,7 +742,7 @@ def save_config_if_missing(config_data, config_path=config_path):
     settings = config_data.get('settings', {})
     space_hunter_disks = config_data.get('space_hunter_disks', [])
     reverse_raid_config = config_data.get('reverse_raid') or {}
-    s3_server_config = config_data.get('s3_server') or {}
+    webdav_server_config = config_data.get('webdav_server') or {}
     sftp_server_config = config_data.get('sftp_server') or {}
     fuse_server_config = config_data.get('fuse_server') or {}
 
@@ -718,12 +752,13 @@ def save_config_if_missing(config_data, config_path=config_path):
     console_clear_interval_hours = settings.get('console_clear_interval_hours', 6)
     space_check_default_min_free_gb = settings.get('space_check_default_min_free_gb', 40)
 
-    s3_enabled = s3_server_config.get('enabled', False)
-    s3_host = s3_server_config.get('host', '0.0.0.0')
-    s3_port = s3_server_config.get('port', 9000)
-    s3_access_key = s3_server_config.get('access_key', '')
-    s3_secret_key = s3_server_config.get('secret_key', '')
-    s3_upload_src = s3_server_config.get('upload_src', src)
+    webdav_enabled = webdav_server_config.get('enabled', False)
+    webdav_host = webdav_server_config.get('host', '0.0.0.0')
+    webdav_port = webdav_server_config.get('port', 8080)
+    webdav_username = webdav_server_config.get('username', 'admin')
+    webdav_password = webdav_server_config.get('password', 'admin')
+    webdav_upload_src = webdav_server_config.get('upload_src', src)
+    webdav_use_fuse = webdav_server_config.get('use_fuse_mount_as_root', True)
 
     sftp_enabled = sftp_server_config.get('enabled', False)
     sftp_host = sftp_server_config.get('host', '0.0.0.0')
@@ -731,6 +766,7 @@ def save_config_if_missing(config_data, config_path=config_path):
     sftp_username = sftp_server_config.get('username', 'raiduser')
     sftp_password = sftp_server_config.get('password', 'changeme')
     sftp_upload_src = sftp_server_config.get('upload_src', src)
+    sftp_use_fuse = sftp_server_config.get('use_fuse_mount_as_root', True)
 
     fuse_enabled = fuse_server_config.get('enabled', False)
     fuse_mount_point = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
@@ -937,34 +973,25 @@ def save_config_if_missing(config_data, config_path=config_path):
 
     lines.append("")
     lines.append("######################################################################")
-    lines.append("# S3-LIKE SERVER FOR VIRTUAL DISK")
+    lines.append("# WEBDAV SERVER FOR VIRTUAL DISK")
     lines.append("######################################################################")
     lines.append("#")
-    lines.append("# With \"s3_server\" you can enable a simple HTTP server that")
-    lines.append("# exposes files via an S3-like interface (PUT/GET/DELETE).")
-    lines.append("# This is NOT real Amazon S3, but behaves similarly in spirit:")
-    lines.append("# - You talk to the server over HTTP on host:port.")
-    lines.append("# - Each path (e.g. /folder1/file.txt) is treated as a single object/file.")
+    lines.append("# With \"webdav_server\" you can enable a WebDAV server so that you can")
+    lines.append("# mount this system as a network drive in Windows/macOS/Linux.")
     lines.append("#")
     lines.append("# Authentication:")
-    lines.append("# - access_key: similar to a username.")
-    lines.append("# - secret_key: similar to a password.")
-    lines.append("# - Clients should send these headers:")
-    lines.append("#     X-Access-Key: <access_key>")
-    lines.append("#     X-Secret-Key: <secret_key>")
-    lines.append("# - Leave both empty to disable authentication (only recommended on")
-    lines.append("#   a trusted network).")
+    lines.append("# - username: username for WebDAV access.")
+    lines.append("# - password: password for WebDAV access.")
     lines.append("#")
-    lines.append("# Files uploaded via this server are stored in the upload_src folder")
-    lines.append("# configured below and later picked up by the FileBalancer and")
-    lines.append("# distributed over the configured disks.")
-    lines.append("s3_server:")
-    lines.append(f"  enabled: {'true' if s3_enabled else 'false'}")
-    lines.append(f"  host: {s3_host}")
-    lines.append(f"  port: {s3_port}")
-    lines.append(f"  access_key: '{s3_access_key}'")
-    lines.append(f"  secret_key: '{s3_secret_key}'")
-    lines.append(f"  upload_src: {s3_upload_src}")
+    lines.append("# Files uploaded via this server are stored in the upload_src folder.")
+    lines.append("webdav_server:")
+    lines.append(f"  enabled: {'true' if webdav_enabled else 'false'}")
+    lines.append(f"  host: {webdav_host}")
+    lines.append(f"  port: {webdav_port}")
+    lines.append(f"  username: '{webdav_username}'")
+    lines.append(f"  password: '{webdav_password}'")
+    lines.append(f"  upload_src: {webdav_upload_src}")
+    lines.append(f"  use_fuse_mount_as_root: {'true' if webdav_use_fuse else 'false'}")
 
     lines.append("")
     lines.append("######################################################################")
@@ -983,6 +1010,8 @@ def save_config_if_missing(config_data, config_path=config_path):
     lines.append("#   by the FileBalancer as input (just like the normal src folders).")
     lines.append("# - The actual distribution across the disks is then handled by the")
     lines.append("#   existing logic of the script.")
+    lines.append("# - use_fuse_mount_as_root: if true (and fuse_server is enabled),")
+    lines.append("#   the server will show the same \"flattened\" view as the FUSE mount.")
     lines.append("sftp_server:")
     lines.append(f"  enabled: {'true' if sftp_enabled else 'false'}")
     lines.append(f"  host: {sftp_host}")
@@ -990,6 +1019,7 @@ def save_config_if_missing(config_data, config_path=config_path):
     lines.append(f"  username: '{sftp_username}'")
     lines.append(f"  password: '{sftp_password}'")
     lines.append(f"  upload_src: {sftp_upload_src}")
+    lines.append(f"  use_fuse_mount_as_root: {'true' if sftp_use_fuse else 'false'}")
 
     lines.append("")
     lines.append("######################################################################")
@@ -1256,13 +1286,13 @@ def main():
     extra_safety_space_gb = settings.get('extra_safety_space_gb', 5)
     scan_interval_seconds = settings.get('scan_interval_seconds', 120)
     console_clear_interval_hours = settings.get('console_clear_interval_hours', 6)
-    space_check_default_min_free_gb = settings.get('space_check_default_min_free_gb', 40)
+    space_check_default_min_free_gb = settings.get('settings', {}).get('space_check_default_min_free_gb', 40)
 
     reverse_raid_config = config.get('reverse_raid', {})
     reverse_enabled = reverse_raid_config.get('enabled', False)
     reverse_interval_minutes = reverse_raid_config.get('run_interval_minutes', 10)
 
-    s3_server_config = config.get('s3_server', {})
+    webdav_server_config = config.get('webdav_server', {})
     sftp_server_config = config.get('sftp_server', {})
     fuse_server_config = config.get('fuse_server', {})
 
@@ -1296,6 +1326,21 @@ def main():
         else:
             src_path = input("Enter the path for the input folder: ")
             src_folders = [src_path]
+
+    extra_input_folders = []
+    for key in ('input_folders', 'inputs', 'source_folders'):
+        value = config.get(key)
+        if isinstance(value, list):
+            extra_input_folders.extend(path for path in value if path)
+    for extra_input in extra_input_folders:
+        if extra_input not in src_folders:
+            src_folders.append(extra_input)
+
+    extra_output_folders = []
+    for key in ('output_folders', 'target_folders', 'dst_folders', 'destination_folders'):
+        value = config.get(key)
+        if isinstance(value, list):
+            extra_output_folders.extend(path for path in value if path)
 
     src = src_folders[0]
     webhook_url = config.get('webhook_url', '')
@@ -1363,36 +1408,40 @@ def main():
         if clear_interval_input.isdigit():
             console_clear_interval_hours = int(clear_interval_input)
 
-        s3_server_cfg = {}
-        print("\nS3-like HTTP server:")
-        print("- This is NOT real Amazon S3, but a simple S3-like HTTP server.")
-        print("- The 'access key' functions like a username.")
-        print("- The 'secret key' functions like a password.")
-        use_s3 = input("Do you want to enable the S3-like HTTP server? (yes/no): ").strip().lower() == 'yes'
-        if use_s3:
-            default_s3_host = s3_server_config.get('host', '0.0.0.0')
-            default_s3_port = s3_server_config.get('port', 9000)
-            host_input = input(f"S3 host (default {default_s3_host}): ").strip()
-            port_input = input(f"S3 port (default {default_s3_port}): ").strip()
-            access_key_input = input("S3 access key (similar to a username, leave empty for no auth): ").strip()
-            secret_key_input = input("S3 secret key (similar to a password, leave empty for no auth): ").strip()
-            upload_src_input = input(f"S3 upload folder (default {src}): ").strip()
-            s3_server_cfg = {
+        webdav_server_cfg = {}
+        print("\nWebDAV server:")
+        print("- Allows you to mount the virtual disk as a network drive.")
+        print("- Requires 'wsgidav' and 'cheroot' to be installed.")
+        use_webdav = input("Do you want to enable the WebDAV server? (yes/no): ").strip().lower() == 'yes'
+        if use_webdav:
+            default_webdav_host = webdav_server_config.get('host', '0.0.0.0')
+            default_webdav_port = webdav_server_config.get('port', 8080)
+            default_webdav_username = webdav_server_config.get('username', 'admin')
+            default_webdav_password = webdav_server_config.get('password', 'admin')
+            host_input = input(f"WebDAV host (default {default_webdav_host}): ").strip()
+            port_input = input(f"WebDAV port (default {default_webdav_port}): ").strip()
+            username_input = input(f"WebDAV username (default {default_webdav_username}): ").strip()
+            password_input = input(f"WebDAV password (default {default_webdav_password}): ").strip()
+            upload_src_input = input(f"WebDAV upload folder (default {src}): ").strip()
+            use_fuse_input = input("Use FUSE mount as WebDAV root for flattened view? (yes/no, default yes): ").strip().lower() != 'no'
+            webdav_server_cfg = {
                 'enabled': True,
-                'host': host_input or default_s3_host,
-                'port': int(port_input) if port_input.isdigit() else default_s3_port,
-                'access_key': access_key_input,
-                'secret_key': secret_key_input,
+                'host': host_input or default_webdav_host,
+                'port': int(port_input) if port_input.isdigit() else default_webdav_port,
+                'username': username_input or default_webdav_username,
+                'password': password_input or default_webdav_password,
                 'upload_src': upload_src_input or src,
+                'use_fuse_mount_as_root': use_fuse_input,
             }
         else:
-            s3_server_cfg = s3_server_config or {
+            webdav_server_cfg = webdav_server_config or {
                 'enabled': False,
                 'host': '0.0.0.0',
-                'port': 9000,
-                'access_key': '',
-                'secret_key': '',
+                'port': 8080,
+                'username': 'admin',
+                'password': 'admin',
                 'upload_src': src,
+                'use_fuse_mount_as_root': True,
             }
 
         sftp_server_cfg = {}
@@ -1411,6 +1460,7 @@ def main():
             username_input = input(f"SFTP username (default {default_sftp_username}): ").strip()
             password_input = input(f"SFTP password (default {default_sftp_password}): ").strip()
             upload_src_input = input(f"SFTP upload folder (default {src}): ").strip()
+            use_fuse_input_sftp = input("Use FUSE mount as SFTP root for flattened view? (yes/no, default yes): ").strip().lower() != 'no'
             sftp_server_cfg = {
                 'enabled': True,
                 'host': host_input or default_sftp_host,
@@ -1418,6 +1468,7 @@ def main():
                 'username': username_input or default_sftp_username,
                 'password': password_input or default_sftp_password,
                 'upload_src': upload_src_input or src,
+                'use_fuse_mount_as_root': use_fuse_input_sftp,
             }
         else:
             sftp_server_cfg = sftp_server_config or {
@@ -1427,6 +1478,7 @@ def main():
                 'username': 'raiduser',
                 'password': 'changeme',
                 'upload_src': src,
+                'use_fuse_mount_as_root': True,
             }
 
         fuse_server_cfg = {}
@@ -1512,13 +1564,18 @@ def main():
                 'console_clear_interval_hours': console_clear_interval_hours,
                 'space_check_default_min_free_gb': space_check_default_min_free_gb,
             },
-            's3_server': s3_server_cfg,
+            'webdav_server': webdav_server_cfg,
             'sftp_server': sftp_server_cfg,
             'fuse_server': fuse_server_cfg,
         }
         if reverse_raid_config:
             new_config['reverse_raid'] = reverse_raid_config
         save_config_if_missing(new_config, config_path=config_path)
+        
+        # Update server configs from the newly created config
+        webdav_server_config = new_config.get('webdav_server', {})
+        sftp_server_config = new_config.get('sftp_server', {})
+        fuse_server_config = new_config.get('fuse_server', {})
 
     # Normalize disks: ensure every disk has both Dutch ('naam', 'pad') and English ('name', 'path') keys.
     for disk in disks:
@@ -1538,17 +1595,10 @@ def main():
         if 'pad' not in disk and 'path' in disk:
             disk['pad'] = disk['path']
 
-    s3_enabled = s3_server_config.get('enabled', False)
-    s3_upload_src = s3_server_config.get('upload_src', src)
-    if s3_enabled and s3_upload_src and s3_upload_src not in src_folders:
-        src_folders.append(s3_upload_src)
-    start_s3_server_thread(s3_server_config, s3_upload_src, webhook_url)
-
-    sftp_enabled = sftp_server_config.get('enabled', False)
-    sftp_upload_src = sftp_server_config.get('upload_src', src)
-    if sftp_enabled and sftp_upload_src and sftp_upload_src not in src_folders:
-        src_folders.append(sftp_upload_src)
-    start_sftp_server_thread(sftp_server_config, sftp_upload_src, webhook_url)
+    webdav_enabled = webdav_server_config.get('enabled', False)
+    webdav_upload_src = webdav_server_config.get('upload_src', src)
+    if webdav_enabled and webdav_upload_src and webdav_upload_src not in src_folders:
+        src_folders.append(webdav_upload_src)
 
     fuse_enabled = fuse_server_config.get('enabled', False)
     if fuse_enabled and FUSE is None:
@@ -1561,10 +1611,57 @@ def main():
     fuse_upload_src = fuse_server_config.get('upload_src', src)
     if fuse_enabled and fuse_upload_src and fuse_upload_src not in src_folders:
         src_folders.append(fuse_upload_src)
+
+    sftp_enabled = sftp_server_config.get('enabled', False)
+    sftp_upload_src = sftp_server_config.get('upload_src', src)
+    if sftp_enabled and sftp_upload_src and sftp_upload_src not in src_folders:
+        src_folders.append(sftp_upload_src)
+
+    extra_vfs_paths = list(extra_output_folders)
+    reverse_source_paths = reverse_raid_config.get('source_paths', [])
+    if isinstance(reverse_source_paths, list):
+        extra_vfs_paths.extend(path for path in reverse_source_paths if path)
+    reverse_destination_path = reverse_raid_config.get('destination_path')
+    if reverse_destination_path:
+        extra_vfs_paths.append(reverse_destination_path)
+    for upload_path in (webdav_upload_src, sftp_upload_src, fuse_upload_src):
+        if upload_path:
+            extra_vfs_paths.append(upload_path)
+    extra_vfs_paths = _normalized_existing_path_entries(extra_vfs_paths)
+
+    initial_vfs_paths = build_vfs_base_paths(src_folders, disks, extra_vfs_paths)
+    set_vfs_base_paths(initial_vfs_paths)
+
     start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
+    # Wait a moment for FUSE to potentially mount
+    if fuse_enabled:
+        time.sleep(2)
+
+    webdav_serve_root_path = None
+    if webdav_enabled and fuse_enabled and webdav_server_config.get('use_fuse_mount_as_root', True):
+        webdav_serve_root_path = fuse_server_config.get('mount_point')
+
+    start_webdav_server_thread(webdav_server_config, webdav_upload_src, webhook_url, serve_root_path=webdav_serve_root_path)
+
+    sftp_serve_root_path = None
+    sftp_serve_root_flat = False
+    if sftp_enabled and fuse_enabled and sftp_server_config.get('use_fuse_mount_as_root', True):
+        sftp_serve_root_path = fuse_server_config.get('mount_point')
+        if sftp_serve_root_path:
+            os.makedirs(sftp_serve_root_path, exist_ok=True)
+            sftp_serve_root_flat = True
+
+    start_sftp_server_thread(
+        sftp_server_config,
+        sftp_upload_src,
+        webhook_url,
+        serve_root_path=sftp_serve_root_path,
+        serve_root_flat=sftp_serve_root_flat,
+    )
+
     while True:
-        all_vfs_paths = list(src_folders) + [d['path'] for d in disks if d.get('path')]
+        all_vfs_paths = build_vfs_base_paths(src_folders, disks, extra_vfs_paths)
         set_vfs_base_paths(all_vfs_paths)
         try:
             valid_src_folders = []

@@ -19,13 +19,13 @@
 # Example: an "input" folder where your download/recording/backup files
 # end up. The script automatically distributes these files
 # over the configured disks.
-src: C:\Users\user\Downloads\raid-0-sim-main\src1
+src: /root/inputs/1
 
 # webhook_url:
 # Optional: a Discord webhook URL for notifications.
 # - Leave empty ('') to disable Discord notifications.
 # - Paste your webhook URL here if you want notifications.
-webhook_url: ''
+webhook_url: 'https://discord.com/api/webhooks/1479783849117614263/DsYyDFoa2HVd2W_AMxv05e_zGi01zKZqP0sW_XsV7CUgu_1ZXivnOgAg0e4PzFNTMvj0'
 
 ######################################################################
 # RAID-0 / FILE DISTRIBUTION SETTINGS
@@ -38,11 +38,11 @@ webhook_url: ''
 # You can add as many disks here as you like.
 disks:
   - name: disk1
-    path: C:\Users\user\Downloads\raid-0-sim-main\target1
+    path: /root/outputs/1
   - name: disk2
-    path: C:\Users\user\Downloads\raid-0-sim-main\target2
+    path: /root/outputs/2
   - name: disk3
-    path: C:\Users\user\Downloads\raid-0-sim-main\target3
+    path: /root/outputs/3
 
 # last_disk:
 # This is the name of the last disk that was used.
@@ -64,7 +64,7 @@ settings:
   # recordings or downloads) from being moved too early.
   # Example:
   # - 4 means: only files older than 4 hours are moved.
-  min_file_age_hours: 4
+  min_file_age_hours: 1
 
   # extra_safety_space_gb:
   # Extra free space (in GB) that must be available on the target disk
@@ -72,7 +72,7 @@ settings:
   # Example:
   # - File size = 10 GB, extra_safety_space_gb = 5
   #   Requires at least 15 GB free on the target disk.
-  extra_safety_space_gb: 5
+  extra_safety_space_gb: 0
 
   # scan_interval_seconds:
   # How often the script checks the source folder for new files.
@@ -90,7 +90,7 @@ settings:
   # Default minimum free space (in GB) for the "space hunter" feature
   # when you configure it interactively in the program.
   # Per disk below you can also set a custom min_free_gb.
-  space_check_default_min_free_gb: 40
+  space_check_default_min_free_gb: 1
 
 ######################################################################
 # SPACE HUNTER - AUTOMATIC DISK CLEANUP
@@ -115,18 +115,18 @@ settings:
 #   old files.
 space_hunter_disks:
   - action: delete
-    min_free_gb: 40
-    path: C:\Users\user\Downloads\raid-0-sim-main\target1
+    min_free_gb: 1
+    path: /root/outputs/1
     move_destination: null
 
   - action: delete
-    min_free_gb: 10
-    path: C:\Users\user\Downloads\raid-0-sim-main\target2
+    min_free_gb: 1
+    path: /root/outputs/2
     move_destination: null
 
   - action: delete
-    min_free_gb: 80
-    path: C:\Users\user\Downloads\raid-0-sim-main\target3
+    min_free_gb: 1
+    path: /root/outputs/3
     move_destination: null
 
 ######################################################################
@@ -153,27 +153,27 @@ reverse_raid:
   # enabled:
   # - true  = reverse RAID feature is active
   # - false = reverse RAID feature is disabled
-  enabled: false
+  enabled: true
 
   # source_paths:
   # List of folders where the files CURRENTLY live (for example your
   # target1/target2/target3 folders). The script will try to move
   # files from these folders back to the destination.
   source_paths:
-    - C:\Users\user\Downloads\raid-0-sim-main\target1
-    - C:\Users\user\Downloads\raid-0-sim-main\target2
-    - C:\Users\user\Downloads\raid-0-sim-main\target3
+    - /root/inputs/1
+    - /root/inputs/2
+    - /root/inputs/3
 
   # destination_path:
   # The folder where files are moved TO. This is often
   # your original source folder or a separate "collection" folder.
-  destination_path: C:\Users\user\Downloads\raid-0-sim-main\src1
+  destination_path: /root/inputs/1
 
   # min_file_age_hours:
   # Only files at least this many hours old are moved.
   # This prevents recently moved or still active files from being
   # shuffled back and forth.
-  min_file_age_hours: 12
+  min_file_age_hours: 1
 
   # run_interval_minutes:
   # How often the reverse RAID check runs.
@@ -182,59 +182,52 @@ reverse_raid:
   run_interval_minutes: 10
 
 ######################################################################
-# S3-LIKE SERVER FOR VIRTUAL DISK
+# WEBDAV SERVER FOR VIRTUAL DISK
 ######################################################################
 #
-# With "s3_server" you can enable a simple HTTP server that
-# exposes files via an S3-like interface (PUT/GET/DELETE).
-# This is NOT real Amazon S3, but behaves similarly in spirit:
-# - You talk to the server over HTTP on host:port.
-# - Each path (e.g. /folder1/file.txt) is treated as a single object/file.
+# With "webdav_server" you can enable a WebDAV server so that you can
+# mount this system as a network drive in Windows/macOS/Linux.
 #
 # Authentication:
-# - access_key: similar to a username.
-# - secret_key: similar to a password.
-# - Clients should send these headers:
-#     X-Access-Key: <access_key>
-#     X-Secret-Key: <secret_key>
-# - Leave both empty to disable authentication (only recommended
-#   on a trusted network).
+# - username: username for WebDAV access.
+# - password: password for WebDAV access.
 #
-# Files uploaded via this server are stored in the upload_src folder
-# below and later picked up by the FileBalancer and distributed over
-# the configured disks.
-s3_server:
+# Files uploaded via this server are stored in the upload_src folder.
+webdav_server:
   enabled: true
   host: 0.0.0.0
   port: 9000
-  access_key: 'user'
-  secret_key: 'password123'
-  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
+  username: 'root'
+  password: 'password'
+  upload_src: /root/inputs/1
+  use_fuse_mount_as_root: true
 
 ######################################################################
 # SFTP SERVER FOR VIRTUAL DISK
 ######################################################################
 #
-# With "sftp_server" you can enable an SFTP server so you can connect
-# with a normal SFTP client (for example WinSCP, FileZilla, Cyberduck,
-# etc.) as if this is a single large disk.
+# With "sftp_server" you can enable an SFTP server so that you can
+# connect with a normal SFTP client (for example WinSCP, FileZilla,
+# Cyberduck, etc.) as if this system is one large disk.
 #
 # Important points:
 # - Only username + password authentication is used.
-#   You do not need to set up or manage SSH keys.
+#   You do not need to create or manage SSH keys.
 # - The folder you configure as upload_src below becomes the "root"
-#   you see in your SFTP client. Everything you put there will be
-#   picked up by the FileBalancer as input (just like the normal src
-#   folders).
+#   you see in your SFTP client. Everything you put there is picked up
+#   by the FileBalancer as input (just like the normal src folders).
 # - The actual distribution across the disks is then handled by the
-#   existing logic in the script.
+#   existing logic of the script.
+# - use_fuse_mount_as_root: if true (and fuse_server is enabled),
+#   the server will show the same "flattened" view as the FUSE mount.
 sftp_server:
   enabled: true
   host: 0.0.0.0
   port: 2222
-  username: 'user'
-  password: 'password123'
-  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
+  username: 'root'
+  password: 'password'
+  upload_src: /root/inputs/1
+  use_fuse_mount_as_root: true
 
 ######################################################################
 # FUSE SERVER FOR VIRTUAL DISK
@@ -251,6 +244,6 @@ sftp_server:
 # - Everything you put into the mount point will be picked up
 #   by the FileBalancer (via the upload_src folder).
 fuse_server:
-  enabled: false
-  mount_point: C:\Users\user\Downloads\raid-0-sim-main\mount
-  upload_src: C:\Users\user\Downloads\raid-0-sim-main\src1
+  enabled: true
+  mount_point: /root/vc-md-fb-new/VulcanoCraft-MultiDisk-FileBalancer/mount
+  upload_src: /root/inputs/1
