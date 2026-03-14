@@ -16,6 +16,7 @@ import hashlib
 import signal
 import atexit
 import subprocess
+import ctypes
 from asyncssh.sftp import SFTPName, SFTPAttrs, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC
 
 def try_import_fuse():
@@ -37,15 +38,113 @@ class FuseOSError(Exception):
 
 try_import_fuse()
 
+def has_admin_privileges():
+    if os.name == 'nt':
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    geteuid = getattr(os, 'geteuid', None)
+    if geteuid is None:
+        return False
+    try:
+        return geteuid() == 0
+    except Exception:
+        return False
+
+
+def is_privilege_error_text(text):
+    message = str(text).lower()
+    privilege_markers = [
+        "permission denied",
+        "access is denied",
+        "administrator",
+        "admin privileges",
+        "requires elevation",
+        "operation not permitted",
+        "must be run as root",
+        "not in the sudoers",
+        "authentication is required",
+        "insufficient privileges",
+    ]
+    return any(marker in message for marker in privilege_markers)
+
+
+def admin_restart_instruction():
+    if os.name == 'nt':
+        return "Restart this program as Administrator and try again."
+    return "Restart this program with sudo/root privileges and try again."
+
+
+def detect_fuse_install_strategy():
+    import platform
+    system = platform.system().lower()
+    if system == "linux":
+        if shutil.which("apt-get"):
+            return "apt-get install libfuse2"
+        if shutil.which("dnf"):
+            return "dnf install fuse-libs"
+        if shutil.which("pacman"):
+            return "pacman install fuse2"
+        return "no supported Linux package manager detected"
+    if system == "windows":
+        if shutil.which("winget"):
+            return "winget install WinFsp.WinFsp"
+        return "PowerShell download and silent install of WinFsp"
+    if system == "darwin":
+        if shutil.which("brew"):
+            return "brew install --cask macfuse"
+        return "direct macFUSE dmg install"
+    return "unsupported operating system for automatic FUSE installer"
+
+
+def print_startup_preflight(webhook_url, fuse_enabled, webdav_enabled, sftp_enabled, fuse_mount_point):
+    import platform
+    os_name = platform.system()
+    os_release = platform.release()
+    py_version = platform.python_version()
+    admin_mode = "yes" if has_admin_privileges() else "no"
+    fuse_loaded = "yes" if FUSE is not None else "no"
+    fuse_required = "yes" if fuse_enabled else "no"
+    install_strategy = detect_fuse_install_strategy()
+    print_and_discord("========== Startup preflight ==========", webhook_url)
+    print_and_discord(f"OS: {os_name} {os_release}", webhook_url)
+    print_and_discord(f"Python: {py_version}", webhook_url)
+    print_and_discord(f"Admin/root privileges: {admin_mode}", webhook_url)
+    print_and_discord(f"Features enabled -> FUSE: {fuse_required}, WebDAV: {'yes' if webdav_enabled else 'no'}, SFTP: {'yes' if sftp_enabled else 'no'}", webhook_url)
+    print_and_discord(f"FUSE python binding loaded: {fuse_loaded}", webhook_url)
+    if fuse_enabled:
+        print_and_discord(f"FUSE mount point: {fuse_mount_point}", webhook_url)
+        print_and_discord(f"FUSE installer strategy: {install_strategy}", webhook_url)
+    print_and_discord("=======================================", webhook_url)
+
+
 def install_libfuse():
     import platform
-    import subprocess
-    import shutil
     system = platform.system().lower()
     print(f"Attempting to install libfuse for {system}...")
+    last_error = ""
 
     def run_cmd(cmd, shell=False):
-        subprocess.run(cmd, check=True, shell=shell)
+        nonlocal last_error
+        result = subprocess.run(cmd, check=True, shell=shell, capture_output=True, text=True)
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        last_error = stderr or stdout
+
+    def install_python_fuse_package():
+        nonlocal last_error
+        pip_cmd = [sys.executable, "-m", "pip", "install", "fusepy"]
+        result = subprocess.run(pip_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        last_error = (result.stderr or result.stdout or "").strip()
+        pip_cmd_break = [sys.executable, "-m", "pip", "install", "fusepy", "--break-system-packages"]
+        result_break = subprocess.run(pip_cmd_break, capture_output=True, text=True)
+        if result_break.returncode == 0:
+            return True
+        last_error = (result_break.stderr or result_break.stdout or last_error).strip()
+        return False
 
     try:
         if system == "linux":
@@ -58,7 +157,7 @@ def install_libfuse():
                 run_cmd(["sudo", "pacman", "-S", "--noconfirm", "fuse2"])
             else:
                 print("No supported package manager (apt, dnf, pacman) found on Linux.")
-                return False
+                return False, "No supported Linux package manager found for FUSE installation.", False
 
         elif system == "windows":
             if shutil.which("winget"):
@@ -83,26 +182,48 @@ def install_libfuse():
                 run_cmd(r"sudo installer -pkg /Volumes/macFUSE/Install\ macFUSE.pkg -target /", shell=True)
                 run_cmd(["hdiutil", "detach", "/Volumes/macFUSE"])
                 run_cmd(["rm", "macfuse.dmg"])
+        else:
+            return False, f"Unsupported operating system for automatic FUSE installation: {system}", False
 
-        # Also ensure fusepy is installed
-        subprocess.run([sys.executable, "-m", "pip", "install", "fusepy"], check=True)
+        if not install_python_fuse_package():
+            needs_admin = is_privilege_error_text(last_error) or not has_admin_privileges()
+            return False, (last_error or "Could not install Python package 'fusepy'."), needs_admin
 
-        return try_import_fuse()
+        if try_import_fuse():
+            return True, "", False
+        return False, "FUSE dependencies were installed but Python still cannot load FUSE on this OS.", False
+    except subprocess.CalledProcessError as e:
+        combined_error = "\n".join(
+            part for part in [str(e), getattr(e, "stderr", ""), getattr(e, "stdout", ""), last_error] if part
+        ).strip()
+        needs_admin = is_privilege_error_text(combined_error) or not has_admin_privileges()
+        print(f"Automatic installation failed: {combined_error}")
+        return False, combined_error, needs_admin
     except Exception as e:
-        print(f"Automatic installation failed: {e}")
-        return False
+        error_text = str(e)
+        needs_admin = is_privilege_error_text(error_text) or not has_admin_privileges()
+        print(f"Automatic installation failed: {error_text}")
+        return False, error_text, needs_admin
 
 current_dir = os.getcwd()
 config_path = os.path.join(current_dir, "config.yml")
 
 _vfs_base_paths = []
 _vfs_base_paths_lock = threading.Lock()
+_flat_root_file_map_cache = {}
+_flat_root_file_map_last_refresh = 0.0
+_flat_root_file_map_needs_refresh = True
+_flat_root_file_map_lock = threading.Lock()
+_flat_root_file_map_ttl_seconds = 2.0
 
 
 def set_vfs_base_paths(paths):
+    global _flat_root_file_map_needs_refresh
     with _vfs_base_paths_lock:
         _vfs_base_paths.clear()
         _vfs_base_paths.extend(p for p in paths if p)
+    with _flat_root_file_map_lock:
+        _flat_root_file_map_needs_refresh = True
 
 
 def get_vfs_base_paths():
@@ -148,14 +269,17 @@ def _build_flat_file_map(base_paths):
     for base in base_paths:
         if not os.path.isdir(base):
             continue
-        for root, _dirs, files in os.walk(base):
-            for file_name in files:
-                physical_path = os.path.join(root, file_name)
-                norm_path = os.path.normcase(os.path.normpath(physical_path))
-                if norm_path in seen_physical_paths:
-                    continue
-                seen_physical_paths.add(norm_path)
-                basename_records.setdefault(file_name, []).append(physical_path)
+        try:
+            for root, _dirs, files in os.walk(base, onerror=lambda _exc: None):
+                for file_name in files:
+                    physical_path = os.path.join(root, file_name)
+                    norm_path = os.path.normcase(os.path.normpath(physical_path))
+                    if norm_path in seen_physical_paths:
+                        continue
+                    seen_physical_paths.add(norm_path)
+                    basename_records.setdefault(file_name, []).append(physical_path)
+        except OSError:
+            continue
 
     for file_name, physical_paths in basename_records.items():
         if len(physical_paths) == 1:
@@ -171,7 +295,27 @@ def _build_flat_file_map(base_paths):
 
 
 def _build_flat_root_file_map():
-    return _build_flat_file_map(get_vfs_base_paths())
+    return get_flat_root_file_map()
+
+
+def get_flat_root_file_map(force_refresh=False):
+    global _flat_root_file_map_cache, _flat_root_file_map_last_refresh, _flat_root_file_map_needs_refresh
+    now = time.time()
+    with _flat_root_file_map_lock:
+        should_refresh = (
+            force_refresh
+            or _flat_root_file_map_needs_refresh
+            or (now - _flat_root_file_map_last_refresh) > _flat_root_file_map_ttl_seconds
+        )
+    if should_refresh:
+        fresh_map = _build_flat_file_map(get_vfs_base_paths())
+        with _flat_root_file_map_lock:
+            _flat_root_file_map_cache = fresh_map
+            _flat_root_file_map_last_refresh = time.time()
+            _flat_root_file_map_needs_refresh = False
+            return dict(_flat_root_file_map_cache)
+    with _flat_root_file_map_lock:
+        return dict(_flat_root_file_map_cache)
 
 
 def get_virtual_item_info(virtual_path):
@@ -341,7 +485,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
                 return False, True, None
             rel = virt.lstrip('/')
             if rel and '/' not in rel and '\\' not in rel:
-                flat_files = _build_flat_root_file_map()
+                flat_files = get_flat_root_file_map()
                 physical_path = flat_files.get(rel)
                 if physical_path:
                     return True, False, physical_path
@@ -366,8 +510,10 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def scandir(self, path):
         virt_dir = self._normalize_virtual(path)
+        flat_files_snapshot = None
         if self._serve_global_flat and virt_dir == '/':
-            names = {name: '/' + name for name in _build_flat_root_file_map()}
+            flat_files_snapshot = get_flat_root_file_map()
+            names = {name: '/' + name for name in flat_files_snapshot}
         elif self._serve_root_path and self._serve_root_flat and virt_dir == '/':
             names = {name: '/' + name for name in _build_flat_file_map([self._serve_root_path])}
         elif self._serve_global_flat:
@@ -393,7 +539,10 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
             yield SFTPName(name.encode('utf-8'), None, attrs)
 
         for name, full_virtual in names.items():
-            is_file, is_dir, physical_path = self._resolve_virtual_item(full_virtual)
+            if flat_files_snapshot is not None and name in flat_files_snapshot:
+                is_file, is_dir, physical_path = True, False, flat_files_snapshot.get(name)
+            else:
+                is_file, is_dir, physical_path = self._resolve_virtual_item(full_virtual)
             if physical_path and os.path.exists(physical_path):
                 st = os.stat(physical_path)
                 attrs = SFTPAttrs.from_local(st)
@@ -717,18 +866,19 @@ def create_virtual_fuse_class():
 
 def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
     if not fuse_config.get('enabled', False):
-        return
+        return {'enabled': False, 'failed': False, 'error': ''}
     if FUSE is None:
         print_and_discord("FUSE support is disabled because 'fusepy' is not installed or libfuse is missing.", webhook_url)
-        return
+        return {'enabled': True, 'failed': True, 'error': "FUSE library not available"}
 
     mount_point = fuse_config.get('mount_point')
     if not mount_point:
         print_and_discord("FUSE mount point not configured.", webhook_url)
-        return
+        return {'enabled': True, 'failed': True, 'error': "FUSE mount point not configured"}
 
     os.makedirs(mount_point, exist_ok=True)
     register_fuse_cleanup_handlers(mount_point, webhook_url, True)
+    fuse_status = {'enabled': True, 'failed': False, 'error': ''}
 
     def run_fuse():
         try:
@@ -736,9 +886,12 @@ def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
             cls = create_virtual_fuse_class()
             FUSE(cls(upload_src_path), mount_point, nothreads=True, foreground=True)
         except Exception as e:
+            fuse_status['failed'] = True
+            fuse_status['error'] = str(e)
             print_and_discord(f"FUSE mount failed: {e}", webhook_url)
 
     threading.Thread(target=run_fuse, daemon=True).start()
+    return fuse_status
 
 
 _fuse_cleanup_lock = threading.Lock()
@@ -1747,12 +1900,28 @@ def main():
         src_folders.append(webdav_upload_src)
 
     fuse_enabled = fuse_server_config.get('enabled', False)
+    fuse_mount_point = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
+    preflight_sftp_enabled = sftp_server_config.get('enabled', False)
+    print_startup_preflight(
+        webhook_url,
+        fuse_enabled=fuse_enabled,
+        webdav_enabled=webdav_enabled,
+        sftp_enabled=preflight_sftp_enabled,
+        fuse_mount_point=fuse_mount_point,
+    )
     if fuse_enabled and FUSE is None:
         print_and_discord("FUSE support requested but libfuse is missing. Attempting automatic installation...", webhook_url)
-        if install_libfuse():
+        install_ok, install_error, needs_admin = install_libfuse()
+        if install_ok:
             print_and_discord("FUSE support installed successfully!", webhook_url)
         else:
-            print_and_discord("Automatic FUSE installation failed. You may need to install it manually.", webhook_url)
+            if needs_admin:
+                print_and_discord(f"Automatic FUSE installation failed due to missing privileges. {admin_restart_instruction()}", webhook_url)
+            else:
+                print_and_discord(f"Automatic FUSE installation failed: {install_error}", webhook_url)
+            raise RuntimeError("FUSE is enabled but installation failed. Cannot continue.")
+    if fuse_enabled and FUSE is None:
+        raise RuntimeError("FUSE is enabled but not available on this system. Cannot continue.")
 
     fuse_upload_src = fuse_server_config.get('upload_src', src)
     if fuse_enabled and fuse_upload_src and fuse_upload_src not in src_folders:
@@ -1778,11 +1947,17 @@ def main():
     initial_vfs_paths = build_vfs_base_paths(src_folders, disks, extra_vfs_paths)
     set_vfs_base_paths(initial_vfs_paths)
 
-    start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
+    fuse_start_status = start_fuse_server_thread(fuse_server_config, fuse_upload_src, webhook_url)
 
-    # Wait a moment for FUSE to potentially mount
     if fuse_enabled:
         time.sleep(2)
+        if fuse_start_status and fuse_start_status.get('failed'):
+            fuse_error = fuse_start_status.get('error', 'Unknown FUSE startup error')
+            if is_privilege_error_text(fuse_error) and not has_admin_privileges():
+                print_and_discord(f"FUSE startup failed due to missing privileges. {admin_restart_instruction()}", webhook_url)
+            else:
+                print_and_discord(f"FUSE startup failed: {fuse_error}", webhook_url)
+            raise RuntimeError("FUSE is enabled but could not start. Cannot continue.")
 
     webdav_serve_root_path = None
     if webdav_enabled and fuse_enabled and webdav_server_config.get('use_fuse_mount_as_root', True):
