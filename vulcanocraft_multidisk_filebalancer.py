@@ -13,6 +13,9 @@ import stat
 import errno
 import sys
 import hashlib
+import signal
+import atexit
+import subprocess
 from asyncssh.sftp import SFTPName, SFTPAttrs, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC
 
 def try_import_fuse():
@@ -294,10 +297,11 @@ class SimpleSSHServer(asyncssh.SSHServer):
         return is_valid
 
 class SimpleSFTPServer(asyncssh.SFTPServer):
-    def __init__(self, chan, upload_src_path, serve_root_path=None, serve_root_flat=False):
+    def __init__(self, chan, upload_src_path, serve_root_path=None, serve_root_flat=False, serve_global_flat=False):
         self._upload_src_path = upload_src_path
         self._serve_root_path = os.path.normpath(serve_root_path) if serve_root_path else None
         self._serve_root_flat = bool(serve_root_flat and self._serve_root_path)
+        self._serve_global_flat = bool(serve_global_flat)
         os.makedirs(self._upload_src_path, exist_ok=True)
         super().__init__(chan)
 
@@ -332,6 +336,16 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
         return False, False, None
 
     def _resolve_virtual_item(self, virt):
+        if self._serve_global_flat:
+            if virt == '/':
+                return False, True, None
+            rel = virt.lstrip('/')
+            if rel and '/' not in rel and '\\' not in rel:
+                flat_files = _build_flat_root_file_map()
+                physical_path = flat_files.get(rel)
+                if physical_path:
+                    return True, False, physical_path
+            return False, False, None
         if not self._serve_root_path:
             return get_virtual_item_info(virt)
         rel = virt.lstrip('/')
@@ -352,8 +366,12 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
 
     async def scandir(self, path):
         virt_dir = self._normalize_virtual(path)
-        if self._serve_root_path and self._serve_root_flat and virt_dir == '/':
+        if self._serve_global_flat and virt_dir == '/':
+            names = {name: '/' + name for name in _build_flat_root_file_map()}
+        elif self._serve_root_path and self._serve_root_flat and virt_dir == '/':
             names = {name: '/' + name for name in _build_flat_file_map([self._serve_root_path])}
+        elif self._serve_global_flat:
+            names = {}
         elif self._serve_root_path:
             is_file, is_dir, scan_path = self._resolve_under_root(virt_dir)
             if not is_dir or not scan_path or not os.path.isdir(scan_path):
@@ -374,7 +392,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
             attrs = SFTPAttrs(permissions=stat.S_IFDIR | 0o755, atime=now, mtime=now, size=0)
             yield SFTPName(name.encode('utf-8'), None, attrs)
 
-        for name, full_virtual in sorted(names.items()):
+        for name, full_virtual in names.items():
             is_file, is_dir, physical_path = self._resolve_virtual_item(full_virtual)
             if physical_path and os.path.exists(physical_path):
                 st = os.stat(physical_path)
@@ -495,7 +513,7 @@ class SimpleSFTPServer(asyncssh.SFTPServer):
         os.makedirs(os.path.dirname(new_physical), exist_ok=True)
         os.rename(old_physical, new_physical)
 
-def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url, serve_root_path=None, serve_root_flat=False):
+def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url, serve_root_path=None, serve_root_flat=False, serve_global_flat=False):
     if not sftp_config.get('enabled', False):
         return
 
@@ -530,6 +548,8 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url, serve_ro
             unique_ips = sorted(list(set(local_ips)))
             print_and_discord(f"Starting SFTP server (asyncssh {asyncssh.__version__}) on {host}:{port}...", webhook_url)
             print_and_discord(f"Detected VM IPs: {', '.join(unique_ips)}", webhook_url)
+            if serve_global_flat:
+                print_and_discord("SFTP root mode: virtual flattened root over all input/output paths", webhook_url)
             if serve_root_path:
                 print_and_discord(f"SFTP root mode: physical path {serve_root_path}", webhook_url)
             server_host_keys = []
@@ -560,6 +580,7 @@ def start_sftp_server_thread(sftp_config, upload_src_path, webhook_url, serve_ro
                     upload_src_path,
                     serve_root_path=serve_root_path,
                     serve_root_flat=serve_root_flat,
+                    serve_global_flat=serve_global_flat,
                 ),
             )
 
@@ -707,6 +728,7 @@ def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
         return
 
     os.makedirs(mount_point, exist_ok=True)
+    register_fuse_cleanup_handlers(mount_point, webhook_url, True)
 
     def run_fuse():
         try:
@@ -717,6 +739,106 @@ def start_fuse_server_thread(fuse_config, upload_src_path, webhook_url):
             print_and_discord(f"FUSE mount failed: {e}", webhook_url)
 
     threading.Thread(target=run_fuse, daemon=True).start()
+
+
+_fuse_cleanup_lock = threading.Lock()
+_fuse_cleanup_done = False
+_fuse_cleanup_mount_point = None
+_fuse_cleanup_webhook_url = ''
+_fuse_cleanup_remove_dir_if_empty = False
+_fuse_cleanup_handlers_registered = False
+
+
+def _run_command_quiet(command):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _attempt_unmount_fuse(mount_point):
+    system = sys.platform.lower()
+    commands = []
+    if system.startswith('win'):
+        commands.extend([
+            ['fusermount', '-u', mount_point],
+            ['umount', mount_point],
+            ['mountvol', mount_point, '/D'],
+        ])
+    elif system == 'darwin':
+        commands.extend([
+            ['umount', mount_point],
+            ['diskutil', 'unmount', mount_point],
+        ])
+    else:
+        commands.extend([
+            ['fusermount', '-u', mount_point],
+            ['fusermount3', '-u', mount_point],
+            ['umount', mount_point],
+        ])
+
+    for command in commands:
+        executable = command[0]
+        if executable not in ('mountvol',) and shutil.which(executable) is None:
+            continue
+        if _run_command_quiet(command):
+            return True
+    return False
+
+
+def cleanup_fuse_mount(force=False):
+    global _fuse_cleanup_done
+    with _fuse_cleanup_lock:
+        if _fuse_cleanup_done and not force:
+            return
+        mount_point = _fuse_cleanup_mount_point
+        webhook_url = _fuse_cleanup_webhook_url
+        remove_dir_if_empty = _fuse_cleanup_remove_dir_if_empty
+        if not mount_point:
+            _fuse_cleanup_done = True
+            return
+
+        try:
+            if os.path.exists(mount_point) and os.path.ismount(mount_point):
+                _attempt_unmount_fuse(mount_point)
+                deadline = time.time() + 2.0
+                while time.time() < deadline and os.path.ismount(mount_point):
+                    time.sleep(0.1)
+
+            if os.path.exists(mount_point) and not os.path.ismount(mount_point) and remove_dir_if_empty:
+                try:
+                    os.rmdir(mount_point)
+                    print_and_discord(f"FUSE mount directory removed: {mount_point}", webhook_url)
+                except OSError:
+                    pass
+        except Exception as e:
+            print_and_discord(f"FUSE cleanup warning: {e}", webhook_url)
+        finally:
+            _fuse_cleanup_done = True
+
+
+def register_fuse_cleanup_handlers(mount_point, webhook_url, remove_dir_if_empty):
+    global _fuse_cleanup_mount_point, _fuse_cleanup_webhook_url
+    global _fuse_cleanup_remove_dir_if_empty, _fuse_cleanup_handlers_registered
+    global _fuse_cleanup_done
+    _fuse_cleanup_mount_point = mount_point
+    _fuse_cleanup_webhook_url = webhook_url
+    _fuse_cleanup_remove_dir_if_empty = remove_dir_if_empty
+    _fuse_cleanup_done = False
+    if _fuse_cleanup_handlers_registered:
+        return
+
+    def _cleanup_signal_handler(signum, frame):
+        cleanup_fuse_mount()
+        raise SystemExit(0)
+
+    atexit.register(cleanup_fuse_mount)
+    for signal_name in ('SIGINT', 'SIGTERM', 'SIGBREAK'):
+        sig = getattr(signal, signal_name, None)
+        if sig is not None:
+            signal.signal(sig, _cleanup_signal_handler)
+    _fuse_cleanup_handlers_registered = True
 
 def get_last_modified_time(path):
     last_modified_timestamp = os.path.getmtime(path)
@@ -1098,39 +1220,71 @@ def check_files_and_move(src, disks, last_disk, webhook_url, min_file_age_hours,
             else:
                 print_and_discord(f"{filename} was modified too recently and will not be moved.", webhook_url)
 
+    if not files_to_move:
+        print_and_discord("\nFile moving completed!", webhook_url)
+        return new_last_disk
+
     print_and_discord("\nStarting to move files:", webhook_url)
-    for rel_path in files_to_move:
+    disk_names = [disk['name'] for disk in disks]
+    disks_by_name = {disk['name']: disk for disk in disks}
+    disk_locks = {disk_name: threading.Lock() for disk_name in disk_names}
+    scheduling_lock = threading.Lock()
+    last_disk_holder = {'name': new_last_disk if new_last_disk in disk_names else disk_names[0]}
+
+    def pick_start_disk():
+        with scheduling_lock:
+            return get_next_disk(last_disk_holder['name'], disk_names)
+
+    def update_last_disk(disk_name):
+        with scheduling_lock:
+            last_disk_holder['name'] = disk_name
+
+    def move_single_file(rel_path):
         source_path = os.path.join(src, rel_path)
+        if not os.path.exists(source_path):
+            return None
         file_size_gb = get_file_size(source_path) // (2**30)
         required_space = file_size_gb + extra_safety_space_gb
+        start_disk = pick_start_disk()
+        start_index = disk_names.index(start_disk)
 
-        file_moved = False
-        target_disk = get_next_disk(new_last_disk, [disk['name'] for disk in disks])
-
-        for _ in range(len(disks)):
-            target_info = next(disk for disk in disks if disk['name'] == target_disk)
+        for offset in range(len(disk_names)):
+            target_disk = disk_names[(start_index + offset) % len(disk_names)]
+            target_info = disks_by_name[target_disk]
             target_path = target_info['path']
-
             print_and_discord(
                 f"File: {rel_path}, Size: {file_size_gb} GB, Required space: {required_space} GB",
                 webhook_url,
             )
             print_and_discord(f"Attempting to move to {target_disk}", webhook_url)
 
-            if has_sufficient_free_space(target_path, required_space):
-                destination_path = os.path.join(target_path, rel_path)
-                os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-                shutil.move(source_path, destination_path)
-                print_and_discord(f"{rel_path} moved to {target_disk}", webhook_url)
-                new_last_disk = target_disk
-                file_moved = True
-                break
-            else:
+            with disk_locks[target_disk]:
+                if not os.path.exists(source_path):
+                    return None
+                if has_sufficient_free_space(target_path, required_space):
+                    destination_path = os.path.join(target_path, rel_path)
+                    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+                    shutil.move(source_path, destination_path)
+                    print_and_discord(f"{rel_path} moved to {target_disk}", webhook_url)
+                    update_last_disk(target_disk)
+                    return target_disk
                 print_and_discord(f"Not enough space for {rel_path} on {target_disk}", webhook_url)
-                target_disk = get_next_disk(target_disk, [disk['name'] for disk in disks])
 
-        if not file_moved:
-            print_and_discord(f"No disk has enough space for {rel_path}, skipping file.", webhook_url)
+        print_and_discord(f"No disk has enough space for {rel_path}, skipping file.", webhook_url)
+        return None
+
+    async def run_transfers():
+        max_workers = max(2, min(8, len(disk_names) * 2, len(files_to_move)))
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def transfer_file(rel_path):
+            async with semaphore:
+                await asyncio.to_thread(move_single_file, rel_path)
+
+        await asyncio.gather(*(transfer_file(rel_path) for rel_path in files_to_move))
+
+    asyncio.run(run_transfers())
+    new_last_disk = last_disk_holder['name']
 
     print_and_discord("\nFile moving completed!", webhook_url)
     return new_last_disk
@@ -1408,6 +1562,9 @@ def main():
         if clear_interval_input.isdigit():
             console_clear_interval_hours = int(clear_interval_input)
 
+        shared_upload_src_input = input(f"Shared upload folder for WebDAV/SFTP/FUSE (default {src}): ").strip()
+        shared_upload_src = shared_upload_src_input or src
+
         webdav_server_cfg = {}
         print("\nWebDAV server:")
         print("- Allows you to mount the virtual disk as a network drive.")
@@ -1422,7 +1579,6 @@ def main():
             port_input = input(f"WebDAV port (default {default_webdav_port}): ").strip()
             username_input = input(f"WebDAV username (default {default_webdav_username}): ").strip()
             password_input = input(f"WebDAV password (default {default_webdav_password}): ").strip()
-            upload_src_input = input(f"WebDAV upload folder (default {src}): ").strip()
             use_fuse_input = input("Use FUSE mount as WebDAV root for flattened view? (yes/no, default yes): ").strip().lower() != 'no'
             webdav_server_cfg = {
                 'enabled': True,
@@ -1430,7 +1586,7 @@ def main():
                 'port': int(port_input) if port_input.isdigit() else default_webdav_port,
                 'username': username_input or default_webdav_username,
                 'password': password_input or default_webdav_password,
-                'upload_src': upload_src_input or src,
+                'upload_src': shared_upload_src,
                 'use_fuse_mount_as_root': use_fuse_input,
             }
         else:
@@ -1459,7 +1615,6 @@ def main():
             port_input = input(f"SFTP port (default {default_sftp_port}): ").strip()
             username_input = input(f"SFTP username (default {default_sftp_username}): ").strip()
             password_input = input(f"SFTP password (default {default_sftp_password}): ").strip()
-            upload_src_input = input(f"SFTP upload folder (default {src}): ").strip()
             use_fuse_input_sftp = input("Use FUSE mount as SFTP root for flattened view? (yes/no, default yes): ").strip().lower() != 'no'
             sftp_server_cfg = {
                 'enabled': True,
@@ -1467,7 +1622,7 @@ def main():
                 'port': int(port_input) if port_input.isdigit() else default_sftp_port,
                 'username': username_input or default_sftp_username,
                 'password': password_input or default_sftp_password,
-                'upload_src': upload_src_input or src,
+                'upload_src': shared_upload_src,
                 'use_fuse_mount_as_root': use_fuse_input_sftp,
             }
         else:
@@ -1493,11 +1648,10 @@ def main():
         if use_fuse:
             default_fuse_mount = fuse_server_config.get('mount_point', os.path.join(current_dir, 'mount'))
             mount_input = input(f"FUSE mount point (default {default_fuse_mount}): ").strip()
-            upload_src_input = input(f"FUSE upload folder (default {src}): ").strip()
             fuse_server_cfg = {
                 'enabled': True,
                 'mount_point': mount_input or default_fuse_mount,
-                'upload_src': upload_src_input or src,
+                'upload_src': shared_upload_src,
             }
         else:
             fuse_server_cfg = fuse_server_config or {
@@ -1518,18 +1672,10 @@ def main():
         reverse_minimum_age_hours = 12
         reverse_interval_minutes = 10
         if use_reverse:
-            try:
-                num_reverse_sources = int(input("How many source folders do you want to configure for reverse RAID? "))
-            except ValueError:
-                num_reverse_sources = 0
-            if num_reverse_sources < 0:
-                num_reverse_sources = 0
-            for i in range(num_reverse_sources):
-                path = input(f"Enter the path for reverse RAID source folder {i + 1}: ").strip()
-                if path:
-                    reverse_source_paths.append(path)
+            reverse_source_paths = [disk['path'] for disk in disks if disk.get('path')]
             if not reverse_source_paths:
-                reverse_source_paths = [disk['path'] for disk in disks if disk.get('path')]
+                reverse_source_paths = [folder for folder in src_folders[1:] if folder]
+            print(f"Reverse RAID source folders automatically set ({len(reverse_source_paths)}): {reverse_source_paths}")
             dest_input = input(f"Enter the destination folder for reverse RAID (default {src}): ").strip()
             if dest_input:
                 reverse_destination_path = dest_input
@@ -1646,11 +1792,10 @@ def main():
 
     sftp_serve_root_path = None
     sftp_serve_root_flat = False
-    if sftp_enabled and fuse_enabled and sftp_server_config.get('use_fuse_mount_as_root', True):
-        sftp_serve_root_path = fuse_server_config.get('mount_point')
-        if sftp_serve_root_path:
-            os.makedirs(sftp_serve_root_path, exist_ok=True)
-            sftp_serve_root_flat = True
+    sftp_serve_global_flat = False
+    if sftp_enabled and sftp_server_config.get('use_fuse_mount_as_root', True):
+        sftp_serve_root_flat = True
+        sftp_serve_global_flat = True
 
     start_sftp_server_thread(
         sftp_server_config,
@@ -1658,6 +1803,7 @@ def main():
         webhook_url,
         serve_root_path=sftp_serve_root_path,
         serve_root_flat=sftp_serve_root_flat,
+        serve_global_flat=sftp_serve_global_flat,
     )
 
     while True:

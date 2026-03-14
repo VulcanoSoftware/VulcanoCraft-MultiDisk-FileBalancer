@@ -160,9 +160,9 @@ reverse_raid:
   # target1/target2/target3 folders). The script will try to move
   # files from these folders back to the destination.
   source_paths:
-    - /root/inputs/1
-    - /root/inputs/2
-    - /root/inputs/3
+    - /root/outputs/1
+    - /root/outputs/2
+    - /root/outputs/3
 
   # destination_path:
   # The folder where files are moved TO. This is often
@@ -245,5 +245,5 @@ sftp_server:
 #   by the FileBalancer (via the upload_src folder).
 fuse_server:
   enabled: true
-  mount_point: /root/vc-md-fb-new/VulcanoCraft-MultiDisk-FileBalancer/mount
+  mount_point: /root/vc-md-bc/VulcanoCraft-MultiDisk-FileBalancer/mount
   upload_src: /root/inputs/1
