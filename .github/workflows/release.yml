@@ -1,0 +1,90 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - "*"
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller -i icon.ico --name VulcanoCraft-MultiDisk-FileBalancer --onefile vulcanocraft_multidisk_filebalancer.py
+
+      - name: Prepare Linux packages
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential rpm
+          sudo gem install --no-document fpm
+          mv dist/VulcanoCraft-MultiDisk-FileBalancer dist/VulcanoCraft-MultiDisk-FileBalancer-linux
+          fpm -s dir -t deb -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer-linux=/usr/bin/vulcanocraft-multidisk-filebalancer
+          fpm -s dir -t rpm -n vulcanocraft-multidisk-filebalancer -v 1.0.${{ github.run_number }} --prefix /usr/bin dist/VulcanoCraft-MultiDisk-FileBalancer-linux=/usr/bin/vulcanocraft-multidisk-filebalancer
+
+      - name: Prepare macOS executable
+        if: matrix.os == 'macos-latest'
+        run: |
+          mv dist/VulcanoCraft-MultiDisk-FileBalancer dist/VulcanoCraft-MultiDisk-FileBalancer-macos
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.os }}
+          path: |
+            dist/VulcanoCraft-MultiDisk-FileBalancer.exe
+            dist/VulcanoCraft-MultiDisk-FileBalancer-linux
+            dist/VulcanoCraft-MultiDisk-FileBalancer-macos
+            *.deb
+            *.rpm
+          if-no-files-found: ignore
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Release Build ${{ github.run_number }}
+          files: |
+            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer.exe
+            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer-linux
+            ./artifacts/VulcanoCraft-MultiDisk-FileBalancer-macos
+            ./artifacts/*.deb
+            ./artifacts/*.rpm
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
