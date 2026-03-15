@@ -148,12 +148,11 @@ jobs:
           merge-multiple: true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{ steps.next_version.outputs.tag }}
+          tag: ${{ steps.next_version.outputs.tag }}
           name: ${{ steps.next_version.outputs.tag }}
-          files: ./artifacts/*
+          artifacts: "./artifacts/*"
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
